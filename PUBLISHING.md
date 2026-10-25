@@ -2,6 +2,8 @@
 
 ## 已就绪
 
+- 1.0.1：CI 全绿，发布目标 registry.npmjs.org
+
 - 包名 `dsh-multithread-downloader`（npm 公共 registry 当前可用）
 - LICENSE (MIT)、CHANGELOG、SECURITY、PUBLISHING
 - `engines.dsh >=0.2.1-rc.2`，`peerDependencies.@deepseek-ai/dsh`

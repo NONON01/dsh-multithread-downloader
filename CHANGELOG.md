@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1
+
+- 修复 Windows + Node 20 下 `npm test` 的 shell 通配符问题，CI 全绿
+- 明确 npm 发布目标为 registry.npmjs.org
+
 ## 1.0.0
 
 首个发布版本。

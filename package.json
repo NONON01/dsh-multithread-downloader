@@ -1,6 +1,6 @@
 {
   "name": "dsh-multithread-downloader",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "description": "多线程分片 HTTP/HTTPS 下载器（DSH 插件）：Host 端分片并发、断点续传、请求头、镜像、校验、限速与 Agent 工具。",
   "icon": "icon.svg",
@@ -67,5 +67,9 @@
   "homepage": "https://github.com/NONON01/dsh-multithread-downloader#readme",
   "bugs": {
     "url": "https://github.com/NONON01/dsh-multithread-downloader/issues"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
   }
 }

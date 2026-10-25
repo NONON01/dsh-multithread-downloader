@@ -7,6 +7,8 @@ Host 端用 HTTP Range 分片并发下载，Web GUI 提供侧边栏面板、对�
 在 DSH 插件管理里把本包作为 bundle 安装（本地目录或 registry 包），重启/热重载后生效。
 
 - 包名：`dsh-multithread-downloader`
+- npm：https://www.npmjs.com/package/dsh-multithread-downloader
+- 安装：`npm i dsh-multithread-downloader`
 - 最低 DSH：`>=0.2.1-rc.2`
 - Node：`>=20`
 

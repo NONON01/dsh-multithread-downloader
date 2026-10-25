@@ -13,6 +13,10 @@
 - 原生助手构建脚本 `bin/build.ps1`
   - `bin/picker.exe` SHA-256：`8b4a4f2c6683fbedd26647d8a1ed306ea9c3daaaa24fd6798ee9089368dd330f`
 
+## npm
+
+已发布 `dsh-multithread-downloader@1.0.1` 到 registry.npmjs.org（2026-10-25）。
+
 ## 发布前仍需人工完成
 
 1. ~~仓库地址~~ 已补 `NONON01/dsh-multithread-downloader`

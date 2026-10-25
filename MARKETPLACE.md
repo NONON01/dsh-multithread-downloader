@@ -31,4 +31,6 @@ FTP/SFTP、BT/磁力、浏览器接管、代理、HLS/DASH。
 
 ![选择下载目录](docs/screenshots/picker.png)
 
-待补：对话进度条一张。
+### 对话进度条
+
+![对话进度条](docs/screenshots/dock.png)

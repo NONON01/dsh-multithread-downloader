@@ -27,4 +27,8 @@ FTP/SFTP、BT/磁力、浏览器接管、代理、HLS/DASH。
 
 ![下载器面板](docs/screenshots/panel.png)
 
-待补：对话进度条、目录选择器各一张。
+### 目录选择器
+
+![选择下载目录](docs/screenshots/picker.png)
+
+待补：对话进度条一张。

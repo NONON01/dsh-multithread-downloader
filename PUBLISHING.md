@@ -17,10 +17,13 @@
 
 1. ~~仓库地址~~ 已补 `NONON01/dsh-multithread-downloader`
 2. ~~作者~~ 已填 `NONON01`
-3. Windows 助手签名证书（可选，未签名会触发 SmartScreen）
-4. 在干净 profile 中安装 `npm pack` 产物并验证升级
-5. 市场截图、分类、权限说明
-6. 确认目标 registry（公共 npm 或私有 registry）
+3. ~~市场分类/权限说明~~ 见 `MARKETPLACE.md`；截图待补
+4. ~~目标 registry~~ 已固定 `registry.npmjs.org`
+5. ~~npm 打包校验~~ `npm publish --dry-run` 通过
+6. **npm 登录/令牌**：发布前必须 `npm login --registry=https://registry.npmjs.org` 或提供 `NODE_AUTH_TOKEN`
+7. Windows 助手签名证书（可选，未签名会触发 SmartScreen）
+8. 在干净 profile 中安装 `npm pack` 产物并验证升级
+9. 市场截图
 
 ## 打包检查
 

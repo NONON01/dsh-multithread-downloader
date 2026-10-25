@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Multithread Downloader",
+    "description": "Parallel HTTP Range downloads with a sidebar panel and in-conversation progress strip. Manual downloads are always visible and multi-threaded; the silent and single-connection thresholds (switchable, KB/MB/GB) govern agent-initiated downloads only. Agent autonomy is on by default and lets the agent choose its own thread strategy."
+  }
+}

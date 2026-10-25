@@ -1,0 +1,12 @@
+- insert:
+    - id: multithread-downloader
+      name: 'dsh-multithread-downloader'
+      config:
+        threads: 4
+        largeFileMb: 16
+        silentEnabled: true
+        minThreadMb: 4
+        minThreadEnabled: true
+        agentAutonomy: true
+        rateLimitKb: 0
+        maxConcurrent: 3

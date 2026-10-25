@@ -1,0 +1,8 @@
+node_modules/
+*.tgz
+*.mtd-part
+out/
+dist/
+.DS_Store
+Thumbs.db
+*.log

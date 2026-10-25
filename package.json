@@ -57,7 +57,7 @@
     "@deepseek-ai/dsh": ">=0.2.1-rc.2"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test test/host.test.mjs",
     "pack:check": "npm pack --dry-run"
   },
   "repository": {

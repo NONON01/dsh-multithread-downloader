@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2
+
+- 标记 DSH `0.2.1-rc.5` 兼容性：官方 rc.3 → rc.5 未改动插件使用的 slots / tools / webServer / locale 接口
+- 无功能变更，升级可选
+
 ## 兼容性
 
 - 已核对 DSH `0.2.1-rc.5`：官方 rc.3 → rc.5 仅调整思考内容展示与版本号，插件使用的 slots / tools / webServer / locale 接口未变，1.0.1 可直接运行。

@@ -1,8 +1,26 @@
 # 多线程下载器（DSH 插件）
 
-Host 端用 HTTP Range 分片并发下载，Web GUI 提供侧边栏面板、对话进度条与未完成计数；同时向 agent 注册 `downloader` 工具和 `multithread-downloader` 技能。
+[![npm](https://img.shields.io/npm/v/dsh-multithread-downloader?style=flat-square)](https://www.npmjs.com/package/dsh-multithread-downloader)
+
+在 DSH 里直接把 HTTP/HTTPS 文件下到本机：侧边栏面板、对话进度条、断点续传，Agent 也能通过 `downloader` 工具使用。
+
+![下载器面板](docs/screenshots/panel.png)
+
+## 为什么用它
+
+- **不装外部下载器**：不需要 aria2、IDM 或浏览器扩展，Host 直接写盘
+- **Agent 原生**：工具 + 技能一体，小文件静默下载，不刷屏、不占面板
+- **可控**：分片数、静默阈值、单线程阈值、全局限速、并发队列都能调
+- **真实下载能力**：自定义请求头、镜像回退、SHA-256 校验、断点续传、重启恢复
+- **Windows 体验**：Known Folder 默认目录 + 资源管理器同款目录选择器
 
 ## 安装
+
+```bash
+npm i dsh-multithread-downloader
+```
+
+或在 DSH 插件管理里安装 `dsh-multithread-downloader`。
 
 在 DSH 插件管理里把本包作为 bundle 安装（本地目录或 registry 包），重启/热重载后生效。
 

@@ -27,7 +27,7 @@ npm i dsh-multithread-downloader
 - 包名：`dsh-multithread-downloader`
 - npm：https://www.npmjs.com/package/dsh-multithread-downloader
 - 安装：`npm i dsh-multithread-downloader`
-- 最低 DSH：`>=0.2.1-rc.2`
+- 最低 DSH：`>=0.2.1-rc.2`；已在 **0.2.1-rc.5** 上核对（无插件 API 破坏性变更）
 - Node：`>=20`
 
 ## 兼容性

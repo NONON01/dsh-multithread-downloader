@@ -1,5 +1,9 @@
 # Changelog
 
+## 兼容性
+
+- 已核对 DSH `0.2.1-rc.5`：官方 rc.3 → rc.5 仅调整思考内容展示与版本号，插件使用的 slots / tools / webServer / locale 接口未变，1.0.1 可直接运行。
+
 ## 1.0.1
 
 - 修复 Windows + Node 20 下 `npm test` 的 shell 通配符问题，CI 全绿

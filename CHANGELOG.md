@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1
+
+- 修正 `engines.node` 为 `>=22`：undici 8 在 Node 20 上无法加载
+- CI 矩阵改为 Node 22 / 24，全部通过
+
 ## 1.1.0
 
 - 新增 DoH 解析模式：Cloudflare / AliDNS / Tencent 三选一，开启前弹风险确认；Agent 可用 `doh` / `dohProvider` 按任务启用，失败回退系统 DNS

@@ -61,7 +61,7 @@ window.__ModuleLoader__.load({
       'action.confirmCancel': '确认取消',
       'task.threads': '{count} 线程',
       'task.unknownSize': '大小未知',
-      'chart.title': '大文件进度曲线',
+      'chart.title': '大文件速度曲线',
       'chart.window': '近 {seconds} 秒',
       'chart.eta': '预计剩余 {eta}',
       'chart.average': '平均 {speed}',
@@ -153,7 +153,7 @@ window.__ModuleLoader__.load({
       'action.confirmCancel': 'Confirm cancel',
       'task.threads': '{count} threads',
       'task.unknownSize': 'Unknown size',
-      'chart.title': 'Large-file progress',
+      'chart.title': 'Large-file speed',
       'chart.window': 'Last {seconds}s',
       'chart.eta': 'ETA {eta}',
       'chart.average': 'Avg {speed}',
@@ -316,9 +316,11 @@ button:has(> span > .mtd-icon) { position: relative; }
 .mtd-chart-title { font-size: 11.5px; font-weight: 600; }
 .mtd-chart-meta, .mtd-chart-eta { color: var(--dsw-alias-label-secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
 .mtd-chart-eta { margin-left: auto; }
-.mtd-chart-plot { position: relative; height: 88px; }
+.mtd-chart-plot { position: relative; height: 88px; padding-left: 64px; }
+.mtd-chart-speed-label { position: absolute; left: 0; width: 58px; text-align: right; transform: translateY(-50%); color: var(--dsw-alias-label-secondary); font-size: 9px; line-height: 12px; font-variant-numeric: tabular-nums; pointer-events: none; }
+
 .mtd-chart-svg { display: block; width: 100%; height: 100%; }
-.mtd-chart-grid { stroke: var(--dsw-alias-border-l1); stroke-width: 1; stroke-dasharray: 3 4; opacity: .8; vector-effect: non-scaling-stroke; }
+.mtd-chart-grid { stroke: var(--dsw-alias-label-secondary); stroke-width: 1; stroke-dasharray: 4 4; opacity: .55; vector-effect: non-scaling-stroke; }
 .mtd-chart-area { fill: color-mix(in srgb, var(--dsw-alias-brand-primary) 16%, transparent); stroke: none; }
 .mtd-chart-line { fill: none; stroke: var(--dsw-alias-brand-primary); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; transition: stroke .2s ease; }
 .mtd-chart-line.paused { stroke: var(--dsw-alias-state-warn-primary); }
@@ -392,9 +394,20 @@ button:has(> span > .mtd-icon) { position: relative; }
       const width = 600
       const height = 120
       const inset = 4
-      const y = (p) => height - inset - Math.max(0, Math.min(1, p)) * (height - inset * 2)
+      const peak = Math.max(1, ...points.map((point) => Math.max(0, Number(point.s) || 0)))
+      const unit = peak >= 1024 * 1024 ? 1024 * 1024 : 1024
+      const value = peak / unit
+      const steps = unit === 1024 * 1024
+        ? [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000]
+        : [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000]
+      const stepValue = steps.find((candidate) => value / candidate <= 5) ?? 1000
+      const step = stepValue * unit
+      const maxTick = Math.ceil(peak / step) * step
+      const y = (speed) => height - inset - Math.max(0, Math.min(1, speed / maxTick)) * (height - inset * 2)
       const x = (seconds) => (Math.max(0, Math.min(span, seconds)) / span) * width
-      const line = points.map((point, index) => `${index === 0 ? 'M' : 'L'}${x(point.t).toFixed(1)} ${y(point.p).toFixed(1)}`).join(' ')
+      const ticks = []
+      for (let value = 0; value <= maxTick + step / 2; value += step) ticks.push(value)
+      const line = points.map((point, index) => `${index === 0 ? 'M' : 'L'}${x(point.t).toFixed(1)} ${y(Math.max(0, Number(point.s) || 0)).toFixed(1)}`).join(' ')
       const area = `${line} L${width} ${height} L0 ${height} Z`
 
       const remaining = task.totalBytes - task.receivedBytes
@@ -424,20 +437,23 @@ button:has(> span > .mtd-icon) { position: relative; }
               viewBox: `0 0 ${width} ${height}`,
               preserveAspectRatio: 'none',
               role: 'img',
-              'aria-label': `${t('chart.title')} ${Math.round(last.p * 100)}%`,
+              'aria-label': `${t('chart.title')} ${formatSpeed(last.s || 0)}`,
             },
-            [0.25, 0.5, 0.75].map((ratio) =>
+            h('path', { className: `mtd-chart-area ${task.status}`, d: area }),
+            ticks.map((value) =>
               h('line', {
-                key: ratio,
+                key: `h-${value}`,
                 className: 'mtd-chart-grid',
                 x1: 0,
                 x2: width,
-                y1: y(ratio),
-                y2: y(ratio),
+                y1: y(value),
+                y2: y(value),
               }),
             ),
-            h('path', { className: `mtd-chart-area ${task.status}`, d: area }),
             h('path', { className: `mtd-chart-line ${task.status}`, d: line }),
+          ),
+          ticks.map((value) =>
+            h('span', { key: `tick-${value}`, className: 'mtd-chart-speed-label', style: { top: `${(y(value) / height) * 100}%` } }, formatSpeed(value)),
           ),
           task.status === 'downloading'
             ? h('span', {
@@ -637,9 +653,9 @@ button:has(> span > .mtd-icon) { position: relative; }
             ),
           ),
         ),
-        task.totalBytes >= thresholdBytes && Array.isArray(task.history) && task.history.length > 1
+        (task.totalBytes >= thresholdBytes || task.forceDisplay === true) && Array.isArray(task.history) && task.history.length > 1
           ? h(ProgressChart, { task, t })
-          : task.totalBytes >= thresholdBytes && task.status === 'downloading'
+          : (task.totalBytes >= thresholdBytes || task.forceDisplay === true) && task.status === 'downloading'
             ? h('div', { className: 'mtd-chart mtd-chart-waiting' }, t('chart.waiting'))
             : null,
         h('div', { className: 'mtd-url', title: task.path || task.url }, task.path || task.url),

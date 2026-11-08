@@ -642,6 +642,7 @@ class DownloadTask {
     this.sha256 = typeof input.sha256 === 'string' ? input.sha256.toLowerCase() : ''
     this.sourceUrl = input.sourceUrl ?? this.urls[0]
     this.github = input.github === true
+    this.forceDisplay = input.forceDisplay === true
     this.doh = input.doh === true
     this.dohProvider = input.dohProvider ?? 'alidns'
     this.dir = input.dir
@@ -696,6 +697,7 @@ class DownloadTask {
       doh: this.doh,
       dohProvider: this.dohProvider,
       github: this.github,
+      forceDisplay: this.forceDisplay,
       createdAt: this.createdAt,
       startedAt: this.startedAt,
       finishedAt: this.finishedAt,
@@ -1148,6 +1150,7 @@ class Downloader {
    * - Agent 发起的下载按静默阈值判断。
    */
   shouldDisplay(task) {
+    if (task.forceDisplay === true) return true
     if (task.origin === 'user') return true
     return !this.silentEnabled || task.totalBytes >= this.largeFileBytes
   }
@@ -1449,6 +1452,7 @@ class Downloader {
       doh,
       dohProvider,
       github,
+      forceDisplay: request.forceDisplay === true,
       sourceUrl,
     })
     this.tasks.set(task.id, task)
@@ -1608,6 +1612,7 @@ const TASK_SCHEMA = {
     doh: { type: 'boolean' },
     dohProvider: { type: 'string' },
     github: { type: 'boolean' },
+    forceDisplay: { type: 'boolean' },
   },
 }
 
@@ -1661,6 +1666,7 @@ function makeTool(manager) {
                 doh: input.doh,
                 dohProvider: input.dohProvider,
                 github: input.github,
+                forceDisplay: input.forceDisplay,
                 origin: 'agent',
               })
               tasks.push(manager.get(task.id).snapshot())
@@ -1777,6 +1783,7 @@ function makeRoutes(manager) {
             doh: body.doh,
             dohProvider: body.dohProvider,
             github: body.github,
+            forceDisplay: body.forceDisplay,
             origin: 'user',
           })
           writeJson(response, 200, { ok: true, task })
@@ -1894,6 +1901,7 @@ const SKILL_CONTENT = `# 多线程下载器（downloader）
 - \`singleThread\` 可选：true 强制单连接，false 强制分片；省略时普通模式按阈值，Agent 自主模式下默认分片。
 - \`doh\` 可选：true 让该任务走 DoH 解析；\`dohProvider\` 可选 cloudflare / alidns / tencent。
 - \`github\` 可选：true 时把 \`github.com/.../releases/download/...\` 换成 API 资产链接，绕过 github.com 被污染。
+- \`forceDisplay\` 可选：true 时覆盖静默阈值，强制在面板/对话条显示，并显示速度曲线。
 - 返回任务对象，\`id\` 用于后续控制；下载继续在 Host 后台进行，不要等待它完成。
 
 ### action=list

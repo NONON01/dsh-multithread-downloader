@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.3
+
+- 在 DSH `0.2.2-rc.1` 上完成兼容性验证：Agent 自主模式下带请求头 + SHA-256 的 2 MB 分片下载正常
+- 无功能变更，仅标记 0.2.2 兼容
+
 ## 1.0.2
 
 - 标记 DSH `0.2.1-rc.5` 兼容性：官方 rc.3 → rc.5 未改动插件使用的 slots / tools / webServer / locale 接口

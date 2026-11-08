@@ -72,7 +72,7 @@ minThreadMb: 4          # 单连接阈值（MB）
 minThreadEnabled: true  # 是否启用单连接阈值
 agentAutonomy: true     # 默认开启；阈值设置屏蔽但继续约束 Agent 任务
 announceToAgent: true   # 是否注入系统提示公告
-rateLimitKb: 0          # 全局限速 KB/s，0 不限
+rateLimitKb: 102400     # 全局限速 KB/s（默认 100 MB/s），0 不限
 ```
 
 ## 原生目录选择器

@@ -28,7 +28,7 @@ npm i dsh-multithread-downloader
 - npm：https://www.npmjs.com/package/dsh-multithread-downloader
 - 安装：`npm i dsh-multithread-downloader`
 - 最低 DSH：`>=0.2.1-rc.2`；已在 **0.2.2-rc.1** 上验证（Agent 自主模式、请求头、SHA-256）
-- Node：`>=20`
+- Node：`>=22`
 
 ## 兼容性
 

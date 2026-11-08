@@ -7,7 +7,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { __test } from '../index.js'
 
-const { sanitizeHeaders, retryDelay, RateLimiter, probe, fetchWithRedirects, fileSha256 } = __test
+const { sanitizeHeaders, retryDelay, RateLimiter, probe, fetchWithRedirects, fileSha256, parseGithubReleaseUrl, normalizeDohProvider } = __test
 
 function listen(handler) {
   return new Promise((resolve) => {
@@ -129,4 +129,17 @@ test('fileSha256 matches crypto', async () => {
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
+})
+
+
+test('parseGithubReleaseUrl accepts release download links', () => {
+  const parsed = parseGithubReleaseUrl('https://github.com/ip7z/7zip/releases/download/26.06/7z2606-x64.exe')
+  assert.deepEqual(parsed, { owner: 'ip7z', repo: '7zip', tag: '26.06', asset: '7z2606-x64.exe' })
+  assert.equal(parseGithubReleaseUrl('https://github.com/ip7z/7zip'), null)
+})
+
+test('normalizeDohProvider falls back to alidns', () => {
+  assert.equal(normalizeDohProvider('cloudflare'), 'cloudflare')
+  assert.equal(normalizeDohProvider('tencent'), 'tencent')
+  assert.equal(normalizeDohProvider('unknown'), 'alidns')
 })

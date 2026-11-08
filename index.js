@@ -8,9 +8,12 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
 import { mkdir, open, readdir, rename, statfs, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
+import { lookup as systemLookup } from 'node:dns'
+import { isIP } from 'node:net'
 import { basename, dirname, extname, isAbsolute, join, parse, resolve, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import { Agent, fetch as undiciFetch } from 'undici'
 
 const API_PREFIX = '/api/mtd'
 const MAX_THREADS = 16
@@ -26,6 +29,11 @@ const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504])
 const FORBIDDEN_HEADERS = new Set(['range', 'content-length', 'host', 'connection', 'accept-encoding'])
 const DISK_MARGIN_BYTES = 32 * 1024 * 1024
 const USER_AGENT = 'DSH-MultithreadDownloader/1.0'
+const DOH_PROVIDERS = {
+  cloudflare: { label: 'Cloudflare', url: 'https://cloudflare-dns.com/dns-query' },
+  alidns: { label: 'AliDNS', url: 'https://dns.alidns.com/resolve' },
+  tencent: { label: 'Tencent', url: 'https://doh.pub/dns-query' },
+}
 /** 随插件分发的 Windows 原生目录选择器。 */
 const NATIVE_PICKER = join(dirname(fileURLToPath(import.meta.url)), 'bin', 'picker.exe')
 const JSON_HEADERS = {
@@ -244,6 +252,9 @@ function readSettingsFile(path) {
     if (typeof data.agentAutonomy === 'boolean') settings.agentAutonomy = data.agentAutonomy
     if (Number.isFinite(data.rateLimitBytes)) settings.rateLimitBytes = data.rateLimitBytes
     if (Number.isFinite(data.maxConcurrent)) settings.maxConcurrent = data.maxConcurrent
+    if (typeof data.dohEnabled === 'boolean') settings.dohEnabled = data.dohEnabled
+    if (typeof data.dohProvider === 'string') settings.dohProvider = data.dohProvider
+    if (typeof data.githubEnabled === 'boolean') settings.githubEnabled = data.githubEnabled
     return settings
   } catch {
     return {}
@@ -327,7 +338,7 @@ function describeHttpError(status) {
 }
 
 /** 探测大小、Range 支持与文件名。 */
-async function probeOnce(url, signal, extraHeaders = {}) {
+async function probeOnce(url, signal, extraHeaders = {}, dispatcher = undefined) {
   const headers = { 'accept-encoding': 'identity', 'user-agent': USER_AGENT, ...extraHeaders }
   let size = 0
   let ranges = false
@@ -335,7 +346,7 @@ async function probeOnce(url, signal, extraHeaders = {}) {
   let etag = ''
   let lastModified = ''
   try {
-    const fetched = await fetchWithRedirects(url, { method: 'HEAD', headers }, signal)
+    const fetched = await fetchWithRedirects(url, { method: 'HEAD', headers, dispatcher }, signal)
     const head = fetched.response
     fetched.release()
     if (head.ok) {
@@ -350,7 +361,7 @@ async function probeOnce(url, signal, extraHeaders = {}) {
   }
   if (size > 0 && ranges) return { size, ranges, filename, etag, lastModified }
 
-  const fetched = await fetchWithRedirects(url, { headers: { ...headers, range: 'bytes=0-0' } }, signal)
+  const fetched = await fetchWithRedirects(url, { headers: { ...headers, range: 'bytes=0-0' }, dispatcher }, signal)
   const response = fetched.response
   if (response.status === 206) {
     const match = /\/(\d+)\s*$/.exec(response.headers.get('content-range') ?? '')
@@ -375,11 +386,11 @@ async function probeOnce(url, signal, extraHeaders = {}) {
 }
 
 /** 带重试的探测；401/403 等不可重试错误直接抛出。 */
-async function probe(url, signal, extraHeaders = {}) {
+async function probe(url, signal, extraHeaders = {}, dispatcher = undefined) {
   let lastError
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     try {
-      return await probeOnce(url, signal, extraHeaders)
+      return await probeOnce(url, signal, extraHeaders, dispatcher)
     } catch (error) {
       lastError = error
       const status = /^HTTP (\d+)/.exec(error instanceof Error ? error.message : '')
@@ -389,6 +400,95 @@ async function probe(url, signal, extraHeaders = {}) {
     }
   }
   throw lastError
+}
+
+/** 收敛 DoH 提供商；未知值回退 AliDNS。 */
+function normalizeDohProvider(value) {
+  return Object.hasOwn(DOH_PROVIDERS, value) ? value : 'alidns'
+}
+
+/** 创建一个走 DoH 的 undici dispatcher；解析失败时回退系统 DNS。 */
+function createDohDispatcher(provider) {
+  const endpoint = DOH_PROVIDERS[normalizeDohProvider(provider)].url
+  const cache = new Map()
+
+  const query = async (hostname, type) => {
+    const key = `${type}:${hostname}`
+    const cached = cache.get(key)
+    if (cached !== undefined && cached.expires > Date.now()) return cached.addresses
+    const target = new URL(endpoint)
+    target.searchParams.set('name', hostname)
+    target.searchParams.set('type', type)
+    const response = await undiciFetch(target, {
+      headers: { accept: 'application/dns-json' },
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!response.ok) throw new Error(`DoH HTTP ${response.status}`)
+    const data = await response.json()
+    const wanted = type === 'A' ? 1 : 28
+    const addresses = Array.isArray(data.Answer)
+      ? data.Answer.filter((answer) => answer.type === wanted).map((answer) => answer.data)
+      : []
+    cache.set(key, { addresses, expires: Date.now() + 60_000 })
+    return addresses
+  }
+
+  const lookup = (hostname, options, callback) => {
+    if (isIP(hostname) !== 0) {
+      systemLookup(hostname, options, callback)
+      return
+    }
+    Promise.all([
+      query(hostname, 'A'),
+      query(hostname, 'AAAA').catch(() => []),
+    ]).then(([ipv4, ipv6]) => {
+      const addresses = [
+        ...ipv4.map((address) => ({ address, family: 4 })),
+        ...ipv6.map((address) => ({ address, family: 6 })),
+      ]
+      if (addresses.length === 0) throw new Error(`DoH 没有解析结果：${hostname}`)
+      if (options?.all === true) callback(null, addresses)
+      else callback(null, addresses[0].address, addresses[0].family)
+    }).catch(() => {
+      // DoH 不可用时保持可用性；风险提示会说明存在回退。
+      systemLookup(hostname, options, callback)
+    })
+  }
+
+  return new Agent({ connect: { lookup } })
+}
+
+/** 解析 GitHub Release 直链：owner/repo/releases/download/tag/file。 */
+function parseGithubReleaseUrl(raw) {
+  const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/releases\/download\/(.+)\/([^/]+)$/.exec(raw)
+  if (match === null) return null
+  return {
+    owner: match[1],
+    repo: match[2],
+    tag: decodeURIComponent(match[3]),
+    asset: decodeURIComponent(match[4]),
+  }
+}
+
+/** 把 GitHub Release 直链换成 API 资产链接，避免 github.com 被污染。 */
+async function resolveGithubAsset(raw) {
+  const parsed = parseGithubReleaseUrl(raw)
+  if (parsed === null) return null
+  const api = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/releases/tags/${encodeURIComponent(parsed.tag)}`
+  const response = await undiciFetch(api, {
+    headers: { accept: 'application/vnd.github+json', 'user-agent': USER_AGENT },
+    signal: AbortSignal.timeout(15_000),
+  })
+  if (!response.ok) throw new Error(`GitHub API HTTP ${response.status}`)
+  const release = await response.json()
+  const asset = Array.isArray(release.assets)
+    ? release.assets.find((entry) => entry.name === parsed.asset)
+    : undefined
+  if (asset === undefined) throw new Error(`GitHub Release 中找不到资产：${parsed.asset}`)
+  return {
+    url: asset.url,
+    headers: { accept: 'application/octet-stream' },
+  }
 }
 
 /** 规范化用户提供的请求头：去掉换行、禁止覆盖 Range 等由下载器控制的头。 */
@@ -440,7 +540,7 @@ async function fetchWithRedirects(url, init, signal, maxHops = 5) {
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
     let response
     try {
-      response = await fetch(current, { ...init, headers, redirect: 'manual', signal: controller.signal })
+      response = await undiciFetch(current, { ...init, headers, redirect: 'manual', signal: controller.signal })
     } catch (error) {
       clearTimeout(timer)
       signal.removeEventListener('abort', forward)
@@ -540,6 +640,10 @@ class DownloadTask {
     this.urlIndex = 0
     this.headers = input.headers ?? {}
     this.sha256 = typeof input.sha256 === 'string' ? input.sha256.toLowerCase() : ''
+    this.sourceUrl = input.sourceUrl ?? this.urls[0]
+    this.github = input.github === true
+    this.doh = input.doh === true
+    this.dohProvider = input.dohProvider ?? 'alidns'
     this.dir = input.dir
     this.requestedName = input.filename
     this.threads = input.threads
@@ -577,7 +681,7 @@ class DownloadTask {
   snapshot(options = {}) {
     const snapshot = {
       id: this.id,
-      url: this.url,
+      url: this.sourceUrl || this.url,
       dir: this.dir,
       filename: this.filename,
       path: this.path,
@@ -589,6 +693,9 @@ class DownloadTask {
       speed: this.speed,
       threads: this.chunks.length > 0 ? this.chunks.length : this.threads,
       origin: this.origin,
+      doh: this.doh,
+      dohProvider: this.dohProvider,
+      github: this.github,
       createdAt: this.createdAt,
       startedAt: this.startedAt,
       finishedAt: this.finishedAt,
@@ -667,11 +774,15 @@ class DownloadTask {
     this.run().catch((error) => this.fail(error))
   }
 
+  dispatcher() {
+    return this.doh ? this.manager.dohAgent(this.dohProvider) : undefined
+  }
+
   async probeAny() {
     let lastError
     for (let index = 0; index < this.urls.length; index += 1) {
       try {
-        const result = await probe(this.urls[index], this.abort.signal, this.headers)
+        const result = await probe(this.urls[index], this.abort.signal, this.headers, this.dispatcher())
         this.url = this.urls[index]
         this.urlIndex = index
         return result
@@ -752,7 +863,7 @@ class DownloadTask {
         const headers = { 'accept-encoding': 'identity', 'user-agent': USER_AGENT, ...this.headers }
         if (chunk.end >= 0) headers.range = `bytes=${position}-${chunk.end}`
         const url = this.urls[this.urlIndex % this.urls.length]
-        const fetched = await fetchWithRedirects(url, { headers }, this.abort.signal)
+        const fetched = await fetchWithRedirects(url, { headers, dispatcher: this.dispatcher() }, this.abort.signal)
         release = fetched.release
         const response = fetched.response
         if (response.status === 401 || response.status === 403 || response.status === 407) {
@@ -808,7 +919,7 @@ class DownloadTask {
   async revalidate() {
     let fresh
     try {
-      fresh = await probe(this.url, this.abort.signal, this.headers)
+      fresh = await probe(this.url, this.abort.signal, this.headers, this.dispatcher())
     } catch {
       return
     }
@@ -1018,6 +1129,10 @@ class Downloader {
     this.silentEnabled = options.silentEnabled
     this.rateLimitBytes = options.rateLimitBytes ?? 0
     this.limiter = new RateLimiter(this.rateLimitBytes)
+    this.dohEnabled = options.dohEnabled === true
+    this.dohProvider = normalizeDohProvider(options.dohProvider)
+    this.githubEnabled = options.githubEnabled === true
+    this.dohAgents = new Map()
     this.tasks = new Map()
     this.reservedNames = new Set()
     this.nameQueue = Promise.resolve()
@@ -1138,6 +1253,13 @@ class Downloader {
       this.maxConcurrent = concurrency
       this.pump()
     }
+    if (input.dohEnabled !== undefined || input.dohProvider !== undefined) {
+      this.setDoh(
+        input.dohEnabled !== undefined ? Boolean(input.dohEnabled) : this.dohEnabled,
+        input.dohProvider !== undefined ? input.dohProvider : this.dohProvider,
+      )
+    }
+    if (input.githubEnabled !== undefined) this.githubEnabled = Boolean(input.githubEnabled)
     const persisted = this.persistSettings()
     return {
       largeFileBytes: bytes,
@@ -1149,6 +1271,9 @@ class Downloader {
       silentEnabled: this.silentEnabled,
       rateLimitBytes: this.rateLimitBytes,
       maxConcurrent: this.maxConcurrent,
+      dohEnabled: this.dohEnabled,
+      dohProvider: this.dohProvider,
+      githubEnabled: this.githubEnabled,
       persisted,
       ...this.settingsPersistError === '' ? {} : { persistError: this.settingsPersistError },
     }
@@ -1159,7 +1284,7 @@ class Downloader {
     if (typeof this.settingsPath !== 'string' || this.settingsPath === '') return false
     try {
       const payload = JSON.stringify({
-        version: 7,
+        version: 9,
         largeFileBytes: this.largeFileBytes,
         minThreadBytes: this.minThreadBytes,
         minThreadEnabled: this.minThreadEnabled,
@@ -1167,6 +1292,9 @@ class Downloader {
         silentEnabled: this.silentEnabled,
         rateLimitBytes: this.rateLimitBytes,
         maxConcurrent: this.maxConcurrent,
+        dohEnabled: this.dohEnabled,
+        dohProvider: this.dohProvider,
+        githubEnabled: this.githubEnabled,
       }, null, 2)
       const temporary = `${this.settingsPath}.tmp`
       writeFileSync(temporary, payload)
@@ -1262,6 +1390,25 @@ class Downloader {
     return task
   }
 
+  dohAgent(provider) {
+    const key = normalizeDohProvider(provider)
+    let agent = this.dohAgents.get(key)
+    if (agent === undefined) {
+      agent = createDohDispatcher(key)
+      this.dohAgents.set(key, agent)
+    }
+    return agent
+  }
+
+  setDoh(enabled, provider) {
+    const nextProvider = normalizeDohProvider(provider ?? this.dohProvider)
+    if (this.dohEnabled === enabled && this.dohProvider === nextProvider) return
+    this.dohEnabled = enabled
+    this.dohProvider = nextProvider
+    for (const agent of this.dohAgents.values()) agent.close?.()
+    this.dohAgents.clear()
+  }
+
   async add(request) {
     if (this.tasks.size >= MAX_TASKS) throw new Error(`任务数已达上限 ${MAX_TASKS}，请先移除旧任务`)
     const urls = []
@@ -1273,6 +1420,18 @@ class Downloader {
     }
     const sha256 = typeof request.sha256 === 'string' ? request.sha256.trim().toLowerCase() : ''
     if (sha256 !== '' && !/^[a-f0-9]{64}$/.test(sha256)) throw new Error('sha256 需为 64 位十六进制')
+    const doh = request.doh === undefined ? this.dohEnabled : Boolean(request.doh)
+    const dohProvider = normalizeDohProvider(request.dohProvider ?? this.dohProvider)
+    let headers = sanitizeHeaders(request.headers)
+    let sourceUrl = urls[0]
+    const github = request.github === undefined ? this.githubEnabled : Boolean(request.github)
+    if (github) {
+      const resolved = await resolveGithubAsset(urls[0])
+      if (resolved !== null) {
+        urls[0] = resolved.url
+        headers = { ...headers, ...resolved.headers }
+      }
+    }
     const directory = typeof request.directory === 'string' && request.directory.trim() !== ''
       ? resolve(request.directory.trim())
       : this.root
@@ -1285,8 +1444,12 @@ class Downloader {
       threads: numberConfig(request.threads, this.defaultThreads, 1, MAX_THREADS),
       singleThread: request.singleThread === undefined ? undefined : Boolean(request.singleThread),
       origin: request.origin === 'user' ? 'user' : 'agent',
-      headers: sanitizeHeaders(request.headers),
+      headers,
       sha256,
+      doh,
+      dohProvider,
+      github,
+      sourceUrl,
     })
     this.tasks.set(task.id, task)
     this.persistTasks()
@@ -1442,6 +1605,9 @@ const TASK_SCHEMA = {
     finishedAt: { type: 'integer' },
     visibleInUi: { type: 'boolean' },
     origin: { type: 'string' },
+    doh: { type: 'boolean' },
+    dohProvider: { type: 'string' },
+    github: { type: 'boolean' },
   },
 }
 
@@ -1449,7 +1615,7 @@ function makeTool(manager) {
   return {
     name: 'downloader',
     description:
-      '多线程（HTTP Range 分片）文件下载器，下载到 dsh Host 本机磁盘。action=add 需要 url，可选 directory/filename/threads；action=list 返回任务与进度（limit 默认 20，visibleInUi 表示是否在面板显示）；用返回的 id 执行 pause/resume/cancel/remove；clean 清空已结束任务。下载在 Host 后台继续，不需要等待；达到静默阈值（或开关关闭）的任务额外返回 history；小于阈值且开关开启时任务静默完成，不出现在面板和对话条，但工具 list 仍可见。可用 singleThread 指定单连接/分片；用户手动下载始终显示并多线程；其余下载由 Agent 控制或受阈值约束。',
+      '多线程（HTTP Range 分片）文件下载器，下载到 dsh Host 本机磁盘。action=add 需要 url，可选 directory/filename/threads；action=list 返回任务与进度（limit 默认 20，visibleInUi 表示是否在面板显示）；用返回的 id 执行 pause/resume/cancel/remove；clean 清空已结束任务。下载在 Host 后台继续，不需要等待；达到静默阈值（或开关关闭）的任务额外返回 history；小于阈值且开关开启时任务静默完成，不出现在面板和对话条，但工具 list 仍可见。可用 singleThread 指定单连接/分片；可选 doh=true 走 DoH 解析、github=true 把 GitHub Release 直链换成 API 资产链接；用户手动下载始终显示并多线程；其余下载由 Agent 控制或受阈值约束。',
     parameters: TOOL_PARAMETERS,
     output: {
       schema: {
@@ -1492,6 +1658,9 @@ function makeTool(manager) {
                 singleThread: input.singleThread,
                 headers: input.headers,
                 sha256: input.sha256,
+                doh: input.doh,
+                dohProvider: input.dohProvider,
+                github: input.github,
                 origin: 'agent',
               })
               tasks.push(manager.get(task.id).snapshot())
@@ -1572,6 +1741,9 @@ function makeRoutes(manager) {
           agentAutonomy: manager.agentAutonomy,
           silentEnabled: manager.silentEnabled,
           rateLimitBytes: manager.rateLimitBytes,
+          dohEnabled: manager.dohEnabled,
+          dohProvider: manager.dohProvider,
+          githubEnabled: manager.githubEnabled,
           settingsPath: manager.settingsPath,
         })
       },
@@ -1602,6 +1774,9 @@ function makeRoutes(manager) {
             singleThread: body.singleThread,
             headers: body.headers,
             sha256: body.sha256,
+            doh: body.doh,
+            dohProvider: body.dohProvider,
+            github: body.github,
             origin: 'user',
           })
           writeJson(response, 200, { ok: true, task })
@@ -1690,7 +1865,7 @@ export const inject = ['tools', 'webServer']
 
 /** 每次模型请求注入的简短公告；工具被 restrict 隐藏时自动消失。 */
 const TOOL_GUIDANCE =
-  '多线程下载器：需要把 http/https 文件下载到这台机器时，使用 downloader 工具（action=add 新建，list 查看进度，pause/resume 断点续传，cancel/remove 清理）。下载在 Host 后台进行，不必等待完成；支持自定义请求头（Cookie/Referer/Authorization）、镜像回退、批量 URL、SHA-256 校验、分片重试与全局限速；小于静默阈值（默认 16 MB，可关闭，关闭后显示全部任务）的文件静默下载，不在面板和对话中显示；达到阈值的任务显示进度曲线；小于单线程阈值（默认 4 MB）的文件单连接下载。用户手动下载（面板填 URL/目录/线程）始终显示并多线程；其余下载视为 Agent 任务，受静默/单线程阈值约束，Agent 自主模式下可由 Agent 指定线程策略。完整用法见 skill multithread-downloader。'
+  '多线程下载器：需要把 http/https 文件下载到这台机器时，使用 downloader 工具（action=add 新建，list 查看进度，pause/resume 断点续传，cancel/remove 清理）。下载在 Host 后台进行，不必等待完成；支持自定义请求头（Cookie/Referer/Authorization）、镜像回退、批量 URL、SHA-256 校验、分片重试与全局限速；可选 DoH 解析与 GitHub 资产解析；小于静默阈值（默认 16 MB，可关闭，关闭后显示全部任务）的文件静默下载，不在面板和对话中显示；达到阈值的任务显示进度曲线；小于单线程阈值（默认 4 MB）的文件单连接下载。用户手动下载（面板填 URL/目录/线程）始终显示并多线程；其余下载视为 Agent 任务，受静默/单线程阈值约束，Agent 自主模式下可由 Agent 指定线程策略。完整用法见 skill multithread-downloader。'
 
 /** 注册给所有会话的技能正文（按需加载，不占常驻提示）。 */
 const SKILL_CONTENT = `# 多线程下载器（downloader）
@@ -1717,6 +1892,8 @@ const SKILL_CONTENT = `# 多线程下载器（downloader）
 - 分片失败会自动重试（指数退避，最多 4 次），并对 5xx/429/超时生效。
 - 小于单线程阈值（默认 4 MB，可关闭）的文件只建一个分片、单连接下载。
 - \`singleThread\` 可选：true 强制单连接，false 强制分片；省略时普通模式按阈值，Agent 自主模式下默认分片。
+- \`doh\` 可选：true 让该任务走 DoH 解析；\`dohProvider\` 可选 cloudflare / alidns / tencent。
+- \`github\` 可选：true 时把 \`github.com/.../releases/download/...\` 换成 API 资产链接，绕过 github.com 被污染。
 - 返回任务对象，\`id\` 用于后续控制；下载继续在 Host 后台进行，不要等待它完成。
 
 ### action=list
@@ -1744,6 +1921,8 @@ const SKILL_CONTENT = `# 多线程下载器（downloader）
 - **静默下载阈值**：带独立开关，默认开启、16 MB，单位 KB / MB / GB，范围 1 KB–10 GB。仅约束 Agent 发起的下载：小于该值时静默（不进面板/对话条/计数）；用户手动下载始终显示。关闭开关后所有任务都显示。
 - **单线程阈值**：带独立开关，默认开启、阈值 4 MB，单位 KB/MB。仅约束 Agent 发起的下载；用户手动下载始终按所选线程数分片。关闭后 Agent 任务也不做单连接降级。
 - **Agent 自主模式**：默认开启。开启后面板上的静默/单线程设置被屏蔽（数值保留，仍约束 Agent 任务）；Agent 可用 \`threads\` / \`singleThread\` 指定自己的策略。用户手动下载不受影响。
+- **DoH 解析**：面板开关，开启前有风险确认；可选 Cloudflare / AliDNS / Tencent。Agent 可用 \`doh\` / \`dohProvider\` 为单个任务启用。
+- **GitHub 模式**：Agent 用 \`github: true\` 把 Release 直链换成 API 资产链接，避免 github.com DNS 污染。
 - 以上都是 Host 级设置，自动保存到 profile 目录下的 \`multithread-downloader.json\`，DSH 重启后恢复；\`cordis.patch.yml\` 只作为首次默认值。
 
 ## 界面
@@ -1784,7 +1963,10 @@ export function apply(ctx, config) {
     minThreadEnabled: config?.minThreadEnabled !== false,
     agentAutonomy: config?.agentAutonomy !== false,
     silentEnabled: config?.silentEnabled !== false,
-    rateLimitBytes: numberConfig(config?.rateLimitKb, 0, 0, 1024 * 1024) * 1024,
+    rateLimitBytes: numberConfig(config?.rateLimitKb, 102400, 0, 1024 * 1024) * 1024,
+    dohEnabled: config?.dohEnabled === true,
+    dohProvider: normalizeDohProvider(config?.dohProvider),
+    githubEnabled: config?.githubEnabled === true,
     settingsPath,
     tasksPath,
   })
@@ -1847,4 +2029,4 @@ export function apply(ctx, config) {
 }
 
 /** 仅用于测试的纯函数导出；DSH 加载器会忽略额外命名导出。 */
-export const __test = { sanitizeHeaders, retryDelay, RateLimiter, probe, fetchWithRedirects, fileSha256, freeDiskBytes, defaultDownloadDirectory }
+export const __test = { sanitizeHeaders, retryDelay, RateLimiter, probe, fetchWithRedirects, fileSha256, freeDiskBytes, defaultDownloadDirectory, parseGithubReleaseUrl, normalizeDohProvider, DOH_PROVIDERS }

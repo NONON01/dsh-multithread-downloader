@@ -15,7 +15,7 @@
 
 ## npm
 
-已发布 `dsh-multithread-downloader@1.0.2` 到 registry.npmjs.org（2026-11-03），兼容 DSH 0.2.1-rc.5。
+已发布 `dsh-multithread-downloader@1.1.0` 到 registry.npmjs.org（2026-11-08）：DoH 解析与 GitHub 模式。
 
 ## 发布前仍需人工完成
 

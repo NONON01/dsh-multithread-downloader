@@ -76,6 +76,15 @@ window.__ModuleLoader__.load({
       'settings.concurrency': '同时下载任务数',
       'settings.concurrencyHint': '多余的下载会排队',
       'settings.agentOnHint': '已开启：阈值设置已屏蔽（仍约束 Agent 任务）；手动下载始终多线程并显示',
+      'settings.doh': 'DoH 解析',
+      'settings.dohHint': '通过 HTTPS 查询 DNS，绕过被污染的本地 DNS；失败时回退系统 DNS',
+      'settings.dohProvider': 'DoH 提供商',
+      'settings.dohRiskTitle': '启用 DoH 解析？',
+      'settings.dohRiskText': 'DoH 会把域名查询发送给你选择的第三方解析服务，并可能改变下载连接的实际目标。解析失败时会回退系统 DNS。请确认你信任该提供商后再启用。',
+      'settings.dohRiskConfirm': '确认启用',
+      'settings.github': 'GitHub 模式',
+      'settings.githubHint': '把 GitHub Release 直链换成 API 资产链接，绕过 github.com DNS 污染',
+      'settings.cancel': '取消',
       'settings.agentOffHint': '已关闭：面板参数可调',
       'settings.invalid': '请输入 1 KB – 10 GB 之间的数值',
       'settings.minThread': '单线程阈值',
@@ -163,6 +172,15 @@ window.__ModuleLoader__.load({
       'settings.concurrency': 'Concurrent downloads',
       'settings.concurrencyHint': 'Extra downloads wait in the queue',
       'settings.agentOnHint': 'On: thresholds are masked but still govern agent tasks; manual downloads stay multi-threaded and visible',
+      'settings.doh': 'DoH resolution',
+      'settings.dohHint': 'Resolve DNS over HTTPS to bypass local poisoning; falls back to system DNS on failure',
+      'settings.dohProvider': 'DoH provider',
+      'settings.dohRiskTitle': 'Enable DoH resolution?',
+      'settings.dohRiskText': 'DoH sends DNS queries to the selected third-party resolver and may change the actual download target. It falls back to system DNS when resolution fails. Enable only if you trust this provider.',
+      'settings.dohRiskConfirm': 'Enable',
+      'settings.github': 'GitHub mode',
+      'settings.githubHint': 'Rewrite GitHub Release links to API asset URLs to bypass github.com DNS poisoning',
+      'settings.cancel': 'Cancel',
       'settings.agentOffHint': 'Off: panel controls apply',
       'settings.invalid': 'Enter a value between 1 KB and 10 GB',
       'settings.minThread': 'Single-connection threshold',
@@ -776,6 +794,10 @@ button:has(> span > .mtd-icon) { position: relative; }
       const [silentEnabled, setSilentEnabled] = React.useState(true)
       const [minThreadEnabled, setMinThreadEnabled] = React.useState(true)
       const [agentAutonomy, setAgentAutonomy] = React.useState(false)
+      const [dohEnabled, setDohEnabled] = React.useState(false)
+      const [dohProvider, setDohProvider] = React.useState('alidns')
+      const [dohConfirm, setDohConfirm] = React.useState(false)
+      const [githubEnabled, setGithubEnabled] = React.useState(false)
       const [rate, setRate] = React.useState('0')
       const [concurrency, setConcurrency] = React.useState('3')
       const [headersText, setHeadersText] = React.useState('')
@@ -820,6 +842,15 @@ button:has(> span > .mtd-icon) { position: relative; }
       React.useEffect(() => {
         if (meta !== null && meta.agentAutonomy !== undefined) setAgentAutonomy(Boolean(meta.agentAutonomy))
       }, [meta === null ? undefined : meta.agentAutonomy])
+      React.useEffect(() => {
+        if (meta !== null && meta.dohEnabled !== undefined) setDohEnabled(Boolean(meta.dohEnabled))
+      }, [meta === null ? undefined : meta.dohEnabled])
+      React.useEffect(() => {
+        if (meta !== null && meta.dohProvider !== undefined) setDohProvider(meta.dohProvider)
+      }, [meta === null ? undefined : meta.dohProvider])
+      React.useEffect(() => {
+        if (meta !== null && meta.githubEnabled !== undefined) setGithubEnabled(Boolean(meta.githubEnabled))
+      }, [meta === null ? undefined : meta.githubEnabled])
       React.useEffect(() => {
         if (meta !== null && meta.rateLimitBytes !== undefined) setRate(String(Math.round(meta.rateLimitBytes / 1024)))
       }, [meta === null ? undefined : meta.rateLimitBytes])
@@ -909,6 +940,26 @@ button:has(> span > .mtd-icon) { position: relative; }
       const saveConcurrency = async (value) => {
         setConcurrency(value)
         await saveFlags({ maxConcurrent: Number(value) })
+      }
+
+      const requestDohToggle = (next) => {
+        if (next) {
+          setDohConfirm(true)
+          return
+        }
+        setDohEnabled(false)
+        void saveFlags({ dohEnabled: false })
+      }
+
+      const confirmDoh = () => {
+        setDohConfirm(false)
+        setDohEnabled(true)
+        void saveFlags({ dohEnabled: true, dohProvider })
+      }
+
+      const changeDohProvider = (next) => {
+        setDohProvider(next)
+        if (dohEnabled) void saveFlags({ dohProvider: next })
       }
 
       const saveThreshold = async () => {
@@ -1209,6 +1260,52 @@ button:has(> span > .mtd-icon) { position: relative; }
               h(
                 'div',
                 { className: 'mtd-setting-row' },
+                h(
+                  'label',
+                  { className: 'mtd-switch-row' },
+                  h(Toggle, {
+                    checked: dohEnabled,
+                    label: t('settings.doh'),
+                    onChange: requestDohToggle,
+                  }),
+                  h('span', null, t('settings.doh')),
+                ),
+                h(
+                  'select',
+                  {
+                    className: 'mtd-input mtd-select',
+                    value: dohProvider,
+                    disabled: !dohEnabled,
+                    'aria-label': t('settings.dohProvider'),
+                    onChange: (event) => changeDohProvider(event.target.value),
+                  },
+                  h('option', { value: 'cloudflare' }, 'Cloudflare'),
+                  h('option', { value: 'alidns' }, 'AliDNS'),
+                  h('option', { value: 'tencent' }, 'Tencent'),
+                ),
+                h('span', { className: 'mtd-setting-hint' }, t('settings.dohHint')),
+              ),
+              h(
+                'div',
+                { className: 'mtd-setting-row' },
+                h(
+                  'label',
+                  { className: 'mtd-switch-row' },
+                  h(Toggle, {
+                    checked: githubEnabled,
+                    label: t('settings.github'),
+                    onChange: (next) => {
+                      setGithubEnabled(next)
+                      void saveFlags({ githubEnabled: next })
+                    },
+                  }),
+                  h('span', null, t('settings.github')),
+                ),
+                h('span', { className: 'mtd-setting-hint' }, t('settings.githubHint')),
+              ),
+              h(
+                'div',
+                { className: 'mtd-setting-row' },
                 h('span', { className: 'mtd-setting-label' }, t('settings.rate')),
                 h('input', {
                   id: 'mtd-rate',
@@ -1267,6 +1364,25 @@ button:has(> span > .mtd-icon) { position: relative; }
                 ),
           ),
         ),
+        dohConfirm
+          ? h(
+              'div',
+              { className: 'mtd-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': t('settings.dohRiskTitle') },
+              h(
+                'div',
+                { className: 'mtd-modal-card' },
+                h('div', { className: 'mtd-modal-head' }, h('span', { className: 'mtd-modal-title' }, t('settings.dohRiskTitle'))),
+                h('div', { className: 'mtd-modal-body' }, h('div', { className: 'mtd-modal-note' }, t('settings.dohRiskText'))),
+                h(
+                  'div',
+                  { className: 'mtd-modal-foot' },
+                  h('span', { className: 'mtd-modal-path' }),
+                  h('button', { type: 'button', className: 'mtd-btn', onClick: () => setDohConfirm(false) }, t('settings.cancel')),
+                  h('button', { type: 'button', className: 'mtd-btn mtd-primary', onClick: confirmDoh }, t('settings.dohRiskConfirm')),
+                ),
+              ),
+            )
+          : null,
         pickerOpen && typeof onBrowse === 'function'
           ? h(DirectoryPicker, {
               t,

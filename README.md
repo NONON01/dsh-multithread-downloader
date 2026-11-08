@@ -51,6 +51,8 @@ npm i dsh-multithread-downloader
 - 静默下载阈值：小于阈值的任务不在界面显示（可关闭）
 - 单线程阈值：小于阈值的任务不分片（可开关）
 - Agent 自主模式：默认开启；阈值设置被屏蔽但仍约束 Agent 任务，用户手动下载不受影响
+- 可选 DoH 解析（Cloudflare / AliDNS / Tencent），开启前弹风险确认；Agent 可按任务启用
+- GitHub 模式：面板开关，默认关闭；把 Release 直链换成 API 资产链接，绕过 github.com DNS 污染；Agent 也可按任务启用
 - 设置与未完成任务持久化到 profile 目录
 - Windows 原生目录选择器；macOS/Linux 使用系统命令，失败回退插件内浏览器
 

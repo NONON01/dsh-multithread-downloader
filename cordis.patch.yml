@@ -8,5 +8,8 @@
         minThreadMb: 4
         minThreadEnabled: true
         agentAutonomy: true
-        rateLimitKb: 0
+        rateLimitKb: 102400
+        dohEnabled: false
+        dohProvider: alidns
+        githubEnabled: false
         maxConcurrent: 3

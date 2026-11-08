@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0
+
+- 新增 DoH 解析模式：Cloudflare / AliDNS / Tencent 三选一，开启前弹风险确认；Agent 可用 `doh` / `dohProvider` 按任务启用，失败回退系统 DNS
+- 新增 GitHub 模式：面板开关 + Agent 按任务 `github: true`，把 Release 直链换成 API 资产链接，绕过 github.com DNS 污染
+- 依赖 `undici` 以支持自定义 DNS dispatcher
+- 实测：GitHub 直链在 DoH（AliDNS/Tencent）下可下载；GitHub 模式无需 DoH 也可下载
+
 ## 1.0.4
 
 - 默认全局限速改为 100 MB/s（`rateLimitKb: 102400`），仍可在面板调整或设为 0 关闭

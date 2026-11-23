@@ -7,7 +7,7 @@
 - 包名 `dsh-multithread-downloader`（npm 公共 registry 当前可用）
 - LICENSE (MIT)、CHANGELOG、SECURITY、PUBLISHING
 - `engines.dsh >=0.2.1-rc.2`，`peerDependencies.@deepseek-ai/dsh`
-- 单元/集成测试 8 项通过；CI 覆盖 Linux/Windows/macOS × Node 20/22
+- 单元/集成测试 20 项通过；CI 覆盖 Linux/Windows/macOS × Node 22/24
 - `npm pack` 产物已验证可解包、入口可解析
 - 明确非目标：FTP/SFTP、BT、浏览器接管、代理、HLS/DASH
 - 原生助手构建脚本 `bin/build.ps1`
@@ -16,6 +16,13 @@
 ## npm
 
 已发布 `dsh-multithread-downloader@1.1.0` 到 registry.npmjs.org（2026-11-08）：DoH 解析与 GitHub 模式。
+
+已发布 `dsh-multithread-downloader@1.3.0`（2026-11-23），同时发布 GitHub Release `v1.3.0`：
+续传指纹校验（旁证 + ETag/Last-Modified 复核 + `If-Range`）、自动分片数 4/6/8、多算法校验
+（SHA-256 / SHA-512 / SHA-1 / MD5 / CRC32）、`forceDisplay` 速度曲线。
+
+- npm：`npm view dsh-multithread-downloader dist-tags` → `latest: 1.3.0`
+- Release 附件：`dsh-multithread-downloader-1.3.0.tgz`（与 npm tarball 同一份）
 
 ## 发布前仍需人工完成
 

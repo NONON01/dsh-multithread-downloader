@@ -4,7 +4,7 @@
 
 在 DSH 里直接把 HTTP/HTTPS 文件下到本机：侧边栏面板、对话进度条、断点续传，Agent 也能通过 `downloader` 工具使用。
 
-![下载器面板](docs/screenshots/panel.png)
+![下载器面板](docs/screenshots/panel-tasks.png)
 
 ## 为什么用它
 
@@ -14,20 +14,19 @@
 - **真实下载能力**：自定义请求头、镜像回退、SHA-256 校验、断点续传、重启恢复
 - **Windows 体验**：Known Folder 默认目录 + 资源管理器同款目录选择器
 
+完整说明见 [docs/GUIDE.md](docs/GUIDE.md)。
+
 ## 安装
 
 ```bash
 npm i dsh-multithread-downloader
 ```
 
-或在 DSH 插件管理里安装 `dsh-multithread-downloader`。
-
-在 DSH 插件管理里把本包作为 bundle 安装（本地目录或 registry 包），重启/热重载后生效。
+或在 DSH 插件管理里把 `dsh-multithread-downloader` 作为 bundle 安装（registry 包或本地目录），重启/热重载后生效。
 
 - 包名：`dsh-multithread-downloader`
 - npm：https://www.npmjs.com/package/dsh-multithread-downloader
-- 安装：`npm i dsh-multithread-downloader`
-- 最低 DSH：`>=0.2.1-rc.2`；已在 **0.2.2-rc.1** 上验证（Agent 自主模式、请求头、SHA-256）
+- 最低 DSH：`>=0.2.1-rc.2`；已在 **0.2.2-rc.5** 上验证（Agent 自主模式、请求头、SHA-256、速度曲线）
 - Node：`>=22`
 
 ## 兼容性
@@ -109,6 +108,6 @@ MIT，见 [LICENSE](LICENSE)。
 
 - 需要登录或防盗链的资源，必须显式通过 `headers` 提供 Cookie / Referer / Authorization，本插件不接管浏览器会话
 - 自定义请求头会随未完成任务明文保存在 profile 目录，使用敏感 Cookie 时注意本机权限
-- 跨域重定向时 `Authorization` 由 fetch 按规范剥离，但自定义 `Cookie` 等头可能被转发；敏感头请只用于可信地址
+- 跨域重定向时 `Cookie`、`Authorization`、`Proxy-Authorization` 会被剥离；敏感头请只用于可信地址
 - SHA-256 校验是可选能力，未提供时只校验最终字节数
 - 未完成任务会在重启后恢复为暂停状态；已完成文件保留

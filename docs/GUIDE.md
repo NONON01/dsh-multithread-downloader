@@ -51,13 +51,14 @@
 ## 功能总览
 
 - HTTP/HTTPS Range 分片并发下载，单任务最多 16 连接
-- 断点续传：暂停/恢复、ETag/Last-Modified 校验、Range 被忽略时自动回退单连接
+- 断点续传：暂停/恢复、指纹旁证 + If-Range 校验、Range 被忽略时自动回退单连接
+- 自动分片数：未显式指定时按大小选 4/6/8 条连接
 - 未完成任务持久化，插件重载/DSH 重启后恢复为暂停状态
 - 自定义请求头：Cookie / Referer / Authorization 等
 - 401/403 给出明确提示
 - 分片重试：指数退避，响应头超时 30 秒
 - 镜像回退、批量 URL
-- 可选 SHA-256 校验、下载前磁盘空间检查
+- 可选多算法校验（SHA-256 / SHA-512 / SHA-1 / MD5 / CRC32）、下载前磁盘空间检查
 - 全局限速（默认 100 MB/s）与同时任务数（默认 3）
 - 可选 DoH 解析（Cloudflare / AliDNS / Tencent）
 - GitHub Release 直链自动转 API 资产链接
@@ -174,6 +175,13 @@ Agent 通过 `downloader` 工具创建的任务视为 **Agent 下载**：
 - 关闭开关后 Agent 任务也不做尺寸降级
 - `singleThread` 显式参数优先
 
+### 自动分片数
+
+- 默认开启；仅在调用方没给 `threads` 时生效
+- < 32 MB：4 条；< 256 MB：6 条；更大：8 条
+- 还要受最小分片 512 KB 和 `singleThread` 阈值约束
+- 显式 `threads` 永远优先；关闭后统一用配置/面板线程数
+
 ### 曲线显示条件
 
 满足任一条件时显示速度曲线：
@@ -189,6 +197,8 @@ Agent 通过 `downloader` 工具创建的任务视为 **Agent 下载**：
 |---|---|---|
 | 静默下载阈值 | 16 MB | 1 KB–10 GB；可开关 |
 | 单线程阈值 | 4 MB | 0–10 GB；可开关 |
+| 自动分片数 | 开启 | 按大小 4/6/8；显式 threads 优先 |
+| 续传指纹校验 | 开启 | 续传/收尾核对 ETag、Last-Modified、If-Range |
 | Agent 自主模式 | 开启 | 阈值设置置灰但继续生效 |
 | DoH 解析 | 关闭 | Cloudflare / AliDNS / Tencent |
 | GitHub 模式 | 关闭 | GitHub Release 直链转 API 资产 |
@@ -318,9 +328,12 @@ https://github.com/<owner>/<repo>/releases/download/<tag>/<file>
 ### 暂停/恢复
 
 - 暂停保留 `.mtd-part` 分片文件
-- 恢复前重新探测远端大小、ETag、Last-Modified
-- 远端变化则放弃旧分片，从头下载
+- 恢复前依次核对：`.mtd-meta` 旁证（地址/大小/ETag/Last-Modified）→ 远端重新探测
+- 任一不一致：丢弃旧分片，按新版本从头下载
+- 每个分片请求带 `If-Range`（强 ETag 优先，否则 Last-Modified）；服务器回 200 说明文件已换版本，自动整段重下
+- 完成前再核对一次指纹；不一致直接判失败，不交付拼接文件
 - 服务器忽略 Range 时自动降级为单连接重下
+- 探测失败且本地有校验值时，拒绝在“无法校验”状态下续传（可关掉“续传指纹校验”恢复旧行为）
 
 ### 重启恢复
 
@@ -353,7 +366,8 @@ multithread-downloader-tasks.json
 | `threads` | int | 1–16 |
 | `singleThread` | bool | 强制单连接/分片 |
 | `headers` | object | 自定义请求头 |
-| `sha256` | string | 64 位十六进制校验值 |
+| `checksum` | object | `{ algorithm, value }`；algorithm 支持 md5/sha1/sha256/sha512/crc32 |
+| `sha256` | string | 兼容旧参数，等价于 `checksum.algorithm=sha256` |
 | `doh` | bool | 该任务启用 DoH |
 | `dohProvider` | string | `cloudflare` / `alidns` / `tencent` |
 | `github` | bool | 该任务启用 GitHub 模式 |

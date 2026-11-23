@@ -10,8 +10,8 @@
 
 - **不装外部下载器**：不需要 aria2、IDM 或浏览器扩展，Host 直接写盘
 - **Agent 原生**：工具 + 技能一体，小文件静默下载，不刷屏、不占面板
-- **可控**：分片数、静默阈值、单线程阈值、全局限速、并发队列都能调
-- **真实下载能力**：自定义请求头、镜像回退、SHA-256 校验、断点续传、重启恢复
+- **可控**：分片数（自动 4/6/8 或手动指定）、静默阈值、单线程阈值、全局限速、并发队列都能调
+- **真实下载能力**：自定义请求头、镜像回退、多算法校验、带指纹校验的断点续传、重启恢复
 - **Windows 体验**：Known Folder 默认目录 + 资源管理器同款目录选择器
 
 完整说明见 [docs/GUIDE.md](docs/GUIDE.md)。
@@ -37,12 +37,12 @@ npm i dsh-multithread-downloader
 
 - 自定义请求头（Cookie / Referer / Authorization），401/403 给出明确提示
 - 分片指数退避重试、请求超时、镜像回退、批量 URL
-- SHA-256 校验与下载前磁盘空间检查
+- 多算法校验（SHA-256 / SHA-512 / SHA-1 / MD5 / CRC32）与下载前磁盘空间检查
 - 全局限速与同时任务数（超额排队）
 - 未完成任务持久化，插件重载/DSH 重启后以暂停状态恢复
 
 - HTTP/HTTPS 分片并发下载，服务器不支持 Range 时自动回退单连接
-- 暂停 / 续传 / 取消 / 移除；续传前校验大小、ETag、Last-Modified，远端变化则从头下载
+- 暂停 / 续传 / 取消 / 移除；续传前与收尾校验指纹（旁证 + 大小 + ETag/Last-Modified），分片请求带 `If-Range`，远端变化自动从头重下
 - 服务器中途忽略 Range 时自动降级为单连接重下
 - 面板目录选择：Windows 使用随包原生助手调资源管理器同款 `IFileOpenDialog`（自定义标题、owner 置前）；Electron 宿主优先用 Electron 对话框；其他环境回退插件内目录浏览器
 - 大文件速度曲线（等距速率刻度），多任务分段进度条（对话输入框上方）
@@ -50,6 +50,8 @@ npm i dsh-multithread-downloader
 - 侧边栏未完成计数
 - 静默下载阈值：小于阈值的任务不在界面显示（可关闭）
 - 单线程阈值：小于阈值的任务不分片（可开关）
+- 自动分片数：按大小选 4/6/8 条连接，显式 `threads` 优先（可开关）
+- 续传指纹校验：可关闭；关闭后只比较文件大小
 - Agent 自主模式：默认开启；阈值设置被屏蔽但仍约束 Agent 任务，用户手动下载不受影响
 - 可选 DoH 解析（Cloudflare / AliDNS / Tencent），开启前弹风险确认；Agent 可按任务启用
 - GitHub 模式：面板开关，默认关闭；把 Release 直链换成 API 资产链接，绕过 github.com DNS 污染；Agent 也可按任务启用
@@ -66,7 +68,9 @@ npm i dsh-multithread-downloader
 ## 配置（`cordis.patch.yml`）
 
 ```yaml
-threads: 4              # 默认分片数 1..16
+threads: 4              # 显式/上限分片数 1..16
+autoThreads: true       # 未显式指定线程数时按大小自动 4/6/8
+fingerprintResume: true # 续传前与收尾校验 ETag/Last-Modified，分片请求带 If-Range
 maxConcurrent: 3        # 同时下载任务数
 largeFileMb: 16         # 静默下载阈值（MB），仅作为首次默认值
 silentEnabled: true     # 是否启用静默阈值
@@ -109,5 +113,6 @@ MIT，见 [LICENSE](LICENSE)。
 - 需要登录或防盗链的资源，必须显式通过 `headers` 提供 Cookie / Referer / Authorization，本插件不接管浏览器会话
 - 自定义请求头会随未完成任务明文保存在 profile 目录，使用敏感 Cookie 时注意本机权限
 - 跨域重定向时 `Cookie`、`Authorization`、`Proxy-Authorization` 会被剥离；敏感头请只用于可信地址
-- SHA-256 校验是可选能力，未提供时只校验最终字节数
+- 校验是可选能力，支持 SHA-256 / SHA-512 / SHA-1 / MD5 / CRC32；未提供时只校验最终字节数
+- 指纹校验依赖源站返回 ETag / Last-Modified；两者都不返回时只能按大小判断
 - 未完成任务会在重启后恢复为暂停状态；已完成文件保留

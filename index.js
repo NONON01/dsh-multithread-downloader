@@ -6,7 +6,7 @@
  */
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdir, open, readdir, rename, statfs, unlink } from 'node:fs/promises'
+import { mkdir, open, readFile, readdir, rename, statfs, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { lookup as systemLookup } from 'node:dns'
 import { isIP } from 'node:net'
@@ -26,7 +26,7 @@ const HISTORY_LIMIT = 240
 const MAX_ATTEMPTS = 4
 const REQUEST_TIMEOUT_MS = 30_000
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504])
-const FORBIDDEN_HEADERS = new Set(['range', 'content-length', 'host', 'connection', 'accept-encoding'])
+const FORBIDDEN_HEADERS = new Set(['range', 'if-range', 'content-length', 'host', 'connection', 'accept-encoding'])
 const DISK_MARGIN_BYTES = 32 * 1024 * 1024
 const USER_AGENT = 'DSH-MultithreadDownloader/1.0'
 const DOH_PROVIDERS = {
@@ -250,6 +250,8 @@ function readSettingsFile(path) {
     if (typeof data.minThreadEnabled === 'boolean') settings.minThreadEnabled = data.minThreadEnabled
     if (typeof data.silentEnabled === 'boolean') settings.silentEnabled = data.silentEnabled
     if (typeof data.agentAutonomy === 'boolean') settings.agentAutonomy = data.agentAutonomy
+    if (typeof data.autoThreads === 'boolean') settings.autoThreads = data.autoThreads
+    if (typeof data.fingerprintResume === 'boolean') settings.fingerprintResume = data.fingerprintResume
     if (Number.isFinite(data.rateLimitBytes)) settings.rateLimitBytes = data.rateLimitBytes
     if (Number.isFinite(data.maxConcurrent)) settings.maxConcurrent = data.maxConcurrent
     if (typeof data.dohEnabled === 'boolean') settings.dohEnabled = data.dohEnabled
@@ -326,6 +328,39 @@ async function uniqueName(dir, name, reserved) {
     candidate = `${stem} (${index})${extension}`
   }
   return `${stem}-${Date.now()}${extension}`
+}
+
+/**
+ * 分片数阶梯：仅在调用方没有显式指定线程数、且开启 autoThreads 时生效。
+ * 小文件本来就受单线程阈值约束，这里只负责中大型文件别一直用 4 条连接。
+ */
+function autoThreadsForBytes(size) {
+  if (!Number.isFinite(size) || size <= 0) return 1
+  if (size < 32 * 1024 * 1024) return 4
+  if (size < 256 * 1024 * 1024) return 6
+  return 8
+}
+
+/** 比较两次探测结果；返回到变化的字段名，未变化返回空串。 */
+function fingerprintChange(before, after) {
+  if (before === null || before === undefined || after === null || after === undefined) return ''
+  const beforeSize = Number(before.size) || 0
+  const afterSize = Number(after.size) || 0
+  if (beforeSize > 0 && afterSize > 0 && beforeSize !== afterSize) return 'size'
+  const beforeEtag = typeof before.etag === 'string' ? before.etag : ''
+  const afterEtag = typeof after.etag === 'string' ? after.etag : ''
+  if (beforeEtag !== '' && afterEtag !== '' && beforeEtag !== afterEtag) return 'etag'
+  const beforeModified = typeof before.lastModified === 'string' ? before.lastModified : ''
+  const afterModified = typeof after.lastModified === 'string' ? after.lastModified : ''
+  if (beforeModified !== '' && afterModified !== '' && beforeModified !== afterModified) return 'last-modified'
+  return ''
+}
+
+/** If-Range 只接受强 ETag；弱 ETag（W/"…"）按规范必须回退到 Last-Modified。 */
+function ifRangeValue(etag, lastModified) {
+  if (typeof etag === 'string' && etag !== '' && !/^W\//i.test(etag)) return etag
+  if (typeof lastModified === 'string' && lastModified !== '') return lastModified
+  return ''
 }
 
 /** 把 401/403/407 这类状态转成可操作的提示。 */
@@ -566,21 +601,77 @@ async function fetchWithRedirects(url, init, signal, maxHops = 5) {
   throw new Error('重定向次数过多')
 }
 
-/** 流式计算文件 SHA-256。 */
-async function fileSha256(path) {
+/** 支持的文件校验算法；hex 为规范化后的十六进制长度。 */
+const CHECKSUM_ALGORITHMS = Object.freeze({
+  md5: { label: 'MD5', hex: 32, node: 'md5' },
+  sha1: { label: 'SHA-1', hex: 40, node: 'sha1' },
+  sha256: { label: 'SHA-256', hex: 64, node: 'sha256' },
+  sha512: { label: 'SHA-512', hex: 128, node: 'sha512' },
+  crc32: { label: 'CRC32', hex: 8, node: null },
+})
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256)
+  for (let index = 0; index < 256; index += 1) {
+    let value = index
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) !== 0 ? (value >>> 1) ^ 0xedb88320 : value >>> 1
+    }
+    table[index] = value >>> 0
+  }
+  return table
+})()
+
+/** 流式计算文件校验值；支持 md5/sha1/sha256/sha512/crc32。 */
+async function fileChecksum(path, algorithm = 'sha256') {
+  const spec = CHECKSUM_ALGORITHMS[algorithm]
+  if (spec === undefined) throw new Error(`不支持的校验算法：${algorithm}`)
   const handle = await open(path, 'r')
-  const hash = createHash('sha256')
+  const hash = spec.node === null ? null : createHash(spec.node)
+  let crc = 0xffffffff
   const buffer = Buffer.allocUnsafe(1024 * 1024)
   try {
     for (;;) {
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, null)
       if (bytesRead === 0) break
-      hash.update(buffer.subarray(0, bytesRead))
+      const block = buffer.subarray(0, bytesRead)
+      if (hash !== null) hash.update(block)
+      else {
+        for (const byte of block) crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8)
+      }
     }
   } finally {
     await handle.close()
   }
-  return hash.digest('hex')
+  if (hash !== null) return hash.digest('hex')
+  return ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, '0')
+}
+
+/** 兼容旧调用：默认 SHA-256。 */
+async function fileSha256(path) {
+  return fileChecksum(path, 'sha256')
+}
+
+/** 把请求里的 checksum 或旧 sha256 参数规范化为 { algorithm, value }。 */
+function normalizeChecksum(request) {
+  const raw = request?.checksum
+  let algorithm = ''
+  let value = ''
+  if (raw !== undefined && raw !== null) {
+    if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error('checksum 需为 { algorithm, value } 对象')
+    algorithm = typeof raw.algorithm === 'string' ? raw.algorithm.trim().toLowerCase() : ''
+    value = typeof raw.value === 'string' ? raw.value.trim().toLowerCase() : ''
+  } else if (typeof request?.sha256 === 'string' && request.sha256.trim() !== '') {
+    algorithm = 'sha256'
+    value = request.sha256.trim().toLowerCase()
+  }
+  if (algorithm === '' && value === '') return null
+  const spec = CHECKSUM_ALGORITHMS[algorithm]
+  if (spec === undefined) throw new Error(`不支持的校验算法：${algorithm || '(空)'}（可选 md5/sha1/sha256/sha512/crc32）`)
+  if (!new RegExp(`^[a-f0-9]{${spec.hex}}$`).test(value)) {
+    throw new Error(`${spec.label} 需为 ${spec.hex} 位十六进制`)
+  }
+  return { algorithm, value }
 }
 
 /** 目标目录可用空间；不支持 statfs 时返回 null。 */
@@ -639,7 +730,7 @@ class DownloadTask {
     this.url = this.urls[0]
     this.urlIndex = 0
     this.headers = input.headers ?? {}
-    this.sha256 = typeof input.sha256 === 'string' ? input.sha256.toLowerCase() : ''
+    this.checksum = input.checksum ?? null
     this.sourceUrl = input.sourceUrl ?? this.urls[0]
     this.github = input.github === true
     this.forceDisplay = input.forceDisplay === true
@@ -648,11 +739,17 @@ class DownloadTask {
     this.dir = input.dir
     this.requestedName = input.filename
     this.threads = input.threads
+    this.threadsExplicit = input.threadsExplicit === true
     this.singleThread = input.singleThread
     this.origin = input.origin === 'user' ? 'user' : 'agent'
     this.etag = ''
     this.lastModified = ''
     this.rangeFallback = false
+    /** 指纹状态：''（无校验值）/ verified / unverified / changed。 */
+    this.fingerprintState = ''
+    this.fingerprintNote = ''
+    this.freshRestart = false
+    this.superseded = false
     this.resetFile = false
     this.status = 'queued'
     this.error = ''
@@ -698,6 +795,15 @@ class DownloadTask {
       dohProvider: this.dohProvider,
       github: this.github,
       forceDisplay: this.forceDisplay,
+      ...(this.checksum === null ? {} : { checksum: { ...this.checksum } }),
+      ...(this.fingerprintState === ''
+        ? {}
+        : {
+            fingerprint: {
+              state: this.fingerprintState,
+              ...(this.fingerprintNote === '' ? {} : { note: this.fingerprintNote }),
+            },
+          }),
       createdAt: this.createdAt,
       startedAt: this.startedAt,
       finishedAt: this.finishedAt,
@@ -723,9 +829,10 @@ class DownloadTask {
       etag: this.etag,
       lastModified: this.lastModified,
       headers: this.headers,
-      sha256: this.sha256,
+      checksum: this.checksum,
       origin: this.origin,
       threads: this.threads,
+      threadsExplicit: this.threadsExplicit,
       singleThread: this.singleThread,
       createdAt: this.createdAt,
     }
@@ -780,6 +887,53 @@ class DownloadTask {
     return this.doh ? this.manager.dohAgent(this.dohProvider) : undefined
   }
 
+  /** 分片文件旁的指纹旁证：即使任务记录损坏也能判断这份分片属于哪个版本。 */
+  get metaPath() {
+    return this.path === '' ? '' : `${this.path}.mtd-meta`
+  }
+
+  currentFingerprint() {
+    return { size: this.totalBytes, etag: this.etag, lastModified: this.lastModified }
+  }
+
+  hasValidator() {
+    return this.etag !== '' || this.lastModified !== ''
+  }
+
+  async writeMeta() {
+    const path = this.metaPath
+    if (path === '') return
+    try {
+      const payload = JSON.stringify({
+        version: 1,
+        url: this.url,
+        size: this.totalBytes,
+        etag: this.etag,
+        lastModified: this.lastModified,
+        startedAt: this.createdAt,
+      }, null, 2)
+      await writeFile(path, payload, 'utf8')
+    } catch {
+      // 旁证写不进去只影响续传校验的严格程度，不阻断下载。
+    }
+  }
+
+  async readMeta() {
+    const path = this.metaPath
+    if (path === '') return null
+    try {
+      return JSON.parse(await readFile(path, 'utf8'))
+    } catch {
+      return null
+    }
+  }
+
+  async removeMeta() {
+    const path = this.metaPath
+    if (path === '') return
+    await unlink(path).catch(() => {})
+  }
+
   async probeAny() {
     let lastError
     for (let index = 0; index < this.urls.length; index += 1) {
@@ -820,6 +974,9 @@ class DownloadTask {
     this.handle = await open(this.partPath, 'w+')
     if (this.totalBytes > 0) await this.handle.truncate(this.totalBytes)
     this.chunks = this.buildChunks(result)
+    this.fingerprintState = this.hasValidator() ? 'verified' : ''
+    this.fingerprintNote = ''
+    await this.writeMeta()
     this.status = 'downloading'
     this.startedAt = this.startedAt || Date.now()
     if (this.manager.shouldDisplay(this) && this.history.length === 0) {
@@ -843,7 +1000,11 @@ class DownloadTask {
       // 单连接整段下载（仍用 Range 以支持续传）。
       return [{ start: 0, end: this.totalBytes - 1, cursor: 0, total: this.totalBytes }]
     }
-    const count = Math.max(1, Math.min(this.threads, Math.floor(this.totalBytes / MIN_CHUNK_BYTES) || 1))
+    // 显式线程数优先；否则在开启 autoThreads 时按大小阶梯取一个合理值。
+    const target = this.threadsExplicit || !this.manager.autoThreads
+      ? this.threads
+      : autoThreadsForBytes(this.totalBytes)
+    const count = Math.max(1, Math.min(target, Math.floor(this.totalBytes / MIN_CHUNK_BYTES) || 1))
     const chunkSize = Math.ceil(this.totalBytes / count)
     const chunks = []
     for (let index = 0; index < count; index += 1) {
@@ -857,13 +1018,18 @@ class DownloadTask {
 
   async runChunk(chunk) {
     let attempts = 0
-    while (this.status === 'downloading') {
+    while (this.status === 'downloading' && !this.superseded) {
       const position = chunk.start + chunk.cursor
       if (chunk.end >= 0 && position > chunk.end) return
       let release = null
       try {
         const headers = { 'accept-encoding': 'identity', 'user-agent': USER_AGENT, ...this.headers }
-        if (chunk.end >= 0) headers.range = `bytes=${position}-${chunk.end}`
+        // 续传/分片请求带上 If-Range：远端换了版本时服务器回 200，我们据此重新开始，而不是拼错内容。
+        const ifRange = chunk.end >= 0 ? ifRangeValue(this.etag, this.lastModified) : ''
+        if (chunk.end >= 0) {
+          headers.range = `bytes=${position}-${chunk.end}`
+          if (ifRange !== '') headers['if-range'] = ifRange
+        }
         const url = this.urls[this.urlIndex % this.urls.length]
         const fetched = await fetchWithRedirects(url, { headers, dispatcher: this.dispatcher() }, this.abort.signal)
         release = fetched.release
@@ -876,6 +1042,14 @@ class DownloadTask {
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         if (chunk.end >= 0 && response.status === 200) {
           await response.body?.cancel().catch(() => {})
+          if (ifRange !== '') {
+            this.superseded = true
+            this.fingerprintState = 'changed'
+            this.fingerprintNote = '下载过程中远端文件已变化，已自动从头重新下载'
+            const changed = new Error('远端文件已变化（If-Range 不匹配）')
+            changed.code = 'FINGERPRINT_CHANGED'
+            throw changed
+          }
           const ignored = new Error('服务器忽略了 Range 请求')
           ignored.code = 'RANGE_IGNORED'
           throw ignored
@@ -887,7 +1061,7 @@ class DownloadTask {
         for (;;) {
           const { done, value } = await reader.read()
           if (done) break
-          if (this.status !== 'downloading') {
+          if (this.status !== 'downloading' || this.superseded) {
             await reader.cancel().catch(() => {})
             return
           }
@@ -902,6 +1076,11 @@ class DownloadTask {
         if (chunk.end < 0 || cursor > chunk.end) return
         throw new Error('连接提前结束')
       } catch (error) {
+        // 已有分片发现远端变化：其它分片安静退出，由 runChunks 统一重开。
+        if (this.superseded) {
+          if (error?.code === 'FINGERPRINT_CHANGED') throw error
+          return
+        }
         if (this.status !== 'downloading' || this.abort.signal.aborted) return
         const statusMatch = /^HTTP (\d+)/.exec(error instanceof Error ? error.message : '')
         const status = statusMatch === null ? undefined : Number(statusMatch[1])
@@ -917,18 +1096,46 @@ class DownloadTask {
     }
   }
 
-  /** 续传前重新探测；远端文件变了就放弃旧分片，从头开始。 */
+  /**
+   * 续传前的指纹复核：旁证、远端大小、ETag、Last-Modified 任一项变化，
+   * 都丢弃旧分片从头下载；探测失败时按设置决定降级续传还是明确失败。
+   */
   async revalidate() {
+    let stale = ''
+    const meta = await this.readMeta()
+    if (meta !== null) {
+      if (this.urls.length === 1 && typeof meta.url === 'string' && meta.url !== '' && meta.url !== this.url) {
+        stale = 'url'
+      } else {
+        const diff = fingerprintChange(
+          { size: meta.size, etag: meta.etag, lastModified: meta.lastModified },
+          this.currentFingerprint(),
+        )
+        if (diff !== '') stale = diff
+      }
+    }
     let fresh
     try {
       fresh = await probe(this.url, this.abort.signal, this.headers, this.dispatcher())
-    } catch {
+    } catch (error) {
+      if (this.abort.signal.aborted) throw error
+      if (this.manager.fingerprintResume && this.hasValidator()) {
+        throw new Error('无法校验续传指纹：远端探测失败，为避免把不同版本拼进同一个文件，已停止续传')
+      }
+      this.fingerprintState = 'unverified'
+      this.fingerprintNote = '续传前未能复核远端指纹（探测失败），按本地分片继续'
       return
     }
-    const sizeChanged = fresh.size > 0 && this.totalBytes > 0 && fresh.size !== this.totalBytes
-    const etagChanged = this.etag !== '' && fresh.etag !== '' && this.etag !== fresh.etag
-    const modifiedChanged = this.lastModified !== '' && fresh.lastModified !== '' && this.lastModified !== fresh.lastModified
-    if (!sizeChanged && !etagChanged && !modifiedChanged) return
+    const reason = fingerprintChange(this.currentFingerprint(), fresh) || stale
+    if (reason === '') {
+      this.fingerprintState = this.hasValidator() ? 'verified' : ''
+      this.fingerprintNote = ''
+      return
+    }
+    this.fingerprintState = 'changed'
+    this.fingerprintNote = reason === 'url'
+      ? '分片文件来自另一个地址，已从头重新下载'
+      : '远端文件已变化，已丢弃旧分片重新下载'
     this.totalBytes = fresh.size || this.totalBytes
     this.etag = fresh.etag || this.etag
     this.lastModified = fresh.lastModified || this.lastModified
@@ -938,6 +1145,26 @@ class DownloadTask {
     this.history = []
     if (this.manager.shouldDisplay(this)) this.history = [{ t: 0, p: 0, s: 0 }]
     this.resetFile = true
+  }
+
+  /** 下载途中发现远端文件已变：重新探测并按新版本整段重下（每个任务只重开一次）。 */
+  async restartFresh() {
+    this.freshRestart = true
+    this.superseded = false
+    this.closeHandle()
+    const result = await this.probeAny()
+    this.totalBytes = result.size > 0 ? result.size : 0
+    if (this.totalBytes <= 0) throw new Error('远端文件已变化，且重新探测未拿到文件大小')
+    this.etag = result.etag ?? ''
+    this.lastModified = result.lastModified ?? ''
+    this.chunks = this.buildChunks(result)
+    this.receivedBytes = 0
+    this.progress = 0
+    this.history = []
+    if (this.manager.shouldDisplay(this)) this.history = [{ t: 0, p: 0, s: 0 }]
+    this.resetFile = true
+    this.status = 'downloading'
+    await this.runChunks()
   }
 
   /** 服务器中途忽略 Range：丢掉分片，改用单连接整段重下。 */
@@ -955,8 +1182,9 @@ class DownloadTask {
 
   async runChunks() {
     this.abort = new AbortController()
+    this.superseded = false
     this.status = 'downloading'
-    // 续传前核对远端大小 / ETag / Last-Modified，变化则从头下载，避免拼出混合内容。
+    // 续传前核对旁证 / 大小 / ETag / Last-Modified，变化则从头下载，避免拼出混合内容。
     if (this.chunks.some((chunk) => chunk.cursor > 0)) await this.revalidate()
     if (this.status !== 'downloading') return
     if (this.handle === null) this.handle = await open(this.partPath, 'r+')
@@ -964,6 +1192,7 @@ class DownloadTask {
       const truncateTo = this.chunks.length === 1 && this.chunks[0].end < 0 ? 0 : this.totalBytes
       await this.handle.truncate(truncateTo)
       this.resetFile = false
+      await this.writeMeta()
     }
     // 单连接（无 Range）模式无法从中间续传，续传时从头覆盖。
     if (this.chunks.length === 1 && this.chunks[0].end < 0 && this.chunks[0].cursor > 0) {
@@ -980,6 +1209,10 @@ class DownloadTask {
     if (this.status !== 'downloading') return
     const failed = settled.find((entry) => entry.status === 'rejected')
     if (failed !== undefined) {
+      if (failed.reason?.code === 'FINGERPRINT_CHANGED' && !this.freshRestart) {
+        await this.restartFresh()
+        return
+      }
       if (failed.reason?.code === 'RANGE_IGNORED' && !this.rangeFallback) {
         await this.restartSingleStream()
         return
@@ -990,6 +1223,26 @@ class DownloadTask {
     await this.finalize()
   }
 
+  /** 收尾复核：下载期间远端若被替换（未触发 If-Range 的服务器），拒绝交付混合文件。 */
+  async verifyFinalFingerprint() {
+    if (!this.manager.fingerprintResume || !this.hasValidator()) return
+    let fresh
+    try {
+      fresh = await probe(this.url, this.abort.signal, this.headers, this.dispatcher())
+    } catch {
+      this.fingerprintState = 'unverified'
+      this.fingerprintNote = '完成前未能复核远端指纹（探测失败），文件按已下载字节交付'
+      return
+    }
+    const reason = fingerprintChange(this.currentFingerprint(), fresh)
+    if (reason !== '') {
+      this.fingerprintState = 'changed'
+      this.fingerprintNote = '远端文件在下载过程中已变化，已拒绝交付'
+      throw new Error(`远端文件在下载过程中已变化（${reason}），已拒绝交付；请重新下载`)
+    }
+    this.fingerprintState = 'verified'
+  }
+
   async finalize() {
     if (this.handle === null) throw new Error('文件句柄已关闭')
     const info = await this.handle.stat()
@@ -998,14 +1251,17 @@ class DownloadTask {
     if (this.totalBytes > 0 && info.size !== this.totalBytes) {
       throw new Error(`文件大小不符：期望 ${this.totalBytes}，实际 ${info.size}`)
     }
-    if (this.sha256 !== '') {
-      const actual = await fileSha256(this.partPath)
-      if (actual !== this.sha256) {
-        throw new Error(`SHA-256 不匹配：期望 ${this.sha256}，实际 ${actual}`)
+    await this.verifyFinalFingerprint()
+    if (this.checksum !== null) {
+      const spec = CHECKSUM_ALGORITHMS[this.checksum.algorithm]
+      const actual = await fileChecksum(this.partPath, this.checksum.algorithm)
+      if (actual !== this.checksum.value) {
+        throw new Error(`${spec?.label ?? this.checksum.algorithm} 不匹配：期望 ${this.checksum.value}，实际 ${actual}`)
       }
     }
     await rename(this.partPath, this.path)
     this.manager.releaseName(this.path)
+    await this.removeMeta()
     this.totalBytes = info.size
     this.receivedBytes = info.size
     this.progress = 1
@@ -1093,6 +1349,7 @@ class DownloadTask {
     this.abort.abort()
     this.closeHandle()
     if (this.partPath !== '') await unlink(this.partPath).catch(() => {})
+    await this.removeMeta()
     this.manager.releaseName(this.path)
     this.manager.persistTasks()
     this.manager.pump()
@@ -1102,6 +1359,7 @@ class DownloadTask {
     await this.cancel()
     this.closeHandle()
     if (this.partPath !== '') await unlink(this.partPath).catch(() => {})
+    await this.removeMeta()
     this.manager.tasks.delete(this.id)
     this.manager.persistTasks()
     this.manager.pump()
@@ -1128,6 +1386,8 @@ class Downloader {
     this.settingsPersistError = ''
     this.minThreadEnabled = options.minThreadEnabled
     this.agentAutonomy = options.agentAutonomy
+    this.autoThreads = options.autoThreads !== false
+    this.fingerprintResume = options.fingerprintResume !== false
     this.silentEnabled = options.silentEnabled
     this.rateLimitBytes = options.rateLimitBytes ?? 0
     this.limiter = new RateLimiter(this.rateLimitBytes)
@@ -1216,7 +1476,7 @@ class Downloader {
       if (task.status === 'downloading') speed += task.speed
       if (top === null || (top.status !== 'downloading' && task.status === 'downloading')) top = entry
     }
-    return { unfinished, active: this.activeCount(), totalBytes, receivedBytes, speed, top, tasks, largeFileBytes: this.largeFileBytes, largeFileMb: this.largeFileMb, minThreadBytes: this.minThreadBytes, minThreadMb: this.minThreadMb, minThreadEnabled: this.minThreadEnabled, agentAutonomy: this.agentAutonomy, silentEnabled: this.silentEnabled }
+    return { unfinished, active: this.activeCount(), totalBytes, receivedBytes, speed, top, tasks, largeFileBytes: this.largeFileBytes, largeFileMb: this.largeFileMb, minThreadBytes: this.minThreadBytes, minThreadMb: this.minThreadMb, minThreadEnabled: this.minThreadEnabled, agentAutonomy: this.agentAutonomy, autoThreads: this.autoThreads, fingerprintResume: this.fingerprintResume, silentEnabled: this.silentEnabled }
   }
 
   /** 一次校验并应用两个阈值，避免部分成功。 */
@@ -1243,6 +1503,8 @@ class Downloader {
     this.minThreadMb = Math.round(minThreadBytes / (1024 * 1024))
     if (input.minThreadEnabled !== undefined) this.minThreadEnabled = Boolean(input.minThreadEnabled)
     if (input.agentAutonomy !== undefined) this.agentAutonomy = Boolean(input.agentAutonomy)
+    if (input.autoThreads !== undefined) this.autoThreads = Boolean(input.autoThreads)
+    if (input.fingerprintResume !== undefined) this.fingerprintResume = Boolean(input.fingerprintResume)
     if (input.silentEnabled !== undefined) this.silentEnabled = Boolean(input.silentEnabled)
     if (input.rateLimitBytes !== undefined) {
       const rate = Math.round(Number(input.rateLimitBytes))
@@ -1271,6 +1533,8 @@ class Downloader {
       minThreadMb: this.minThreadMb,
       minThreadEnabled: this.minThreadEnabled,
       agentAutonomy: this.agentAutonomy,
+      autoThreads: this.autoThreads,
+      fingerprintResume: this.fingerprintResume,
       silentEnabled: this.silentEnabled,
       rateLimitBytes: this.rateLimitBytes,
       maxConcurrent: this.maxConcurrent,
@@ -1287,11 +1551,13 @@ class Downloader {
     if (typeof this.settingsPath !== 'string' || this.settingsPath === '') return false
     try {
       const payload = JSON.stringify({
-        version: 9,
+        version: 10,
         largeFileBytes: this.largeFileBytes,
         minThreadBytes: this.minThreadBytes,
         minThreadEnabled: this.minThreadEnabled,
         agentAutonomy: this.agentAutonomy,
+        autoThreads: this.autoThreads,
+        fingerprintResume: this.fingerprintResume,
         silentEnabled: this.silentEnabled,
         rateLimitBytes: this.rateLimitBytes,
         maxConcurrent: this.maxConcurrent,
@@ -1360,9 +1626,10 @@ class Downloader {
           singleThread: record.singleThread,
           origin: record.origin,
           headers: record.headers ?? {},
-          sha256: record.sha256 ?? '',
+          checksum: record.checksum ?? (typeof record.sha256 === 'string' && record.sha256 !== '' ? { algorithm: 'sha256', value: record.sha256 } : null),
         })
         task.requestedName = typeof record.requestedName === 'string' ? record.requestedName : ''
+        task.threadsExplicit = record.threadsExplicit === true
         task.path = record.path
         task.partPath = record.partPath
         task.totalBytes = Number(record.totalBytes) || 0
@@ -1421,8 +1688,7 @@ class Downloader {
       const parsed = parseHttpUrl(candidate)
       if (!urls.includes(parsed.toString())) urls.push(parsed.toString())
     }
-    const sha256 = typeof request.sha256 === 'string' ? request.sha256.trim().toLowerCase() : ''
-    if (sha256 !== '' && !/^[a-f0-9]{64}$/.test(sha256)) throw new Error('sha256 需为 64 位十六进制')
+    const checksum = normalizeChecksum(request)
     const doh = request.doh === undefined ? this.dohEnabled : Boolean(request.doh)
     const dohProvider = normalizeDohProvider(request.dohProvider ?? this.dohProvider)
     let headers = sanitizeHeaders(request.headers)
@@ -1445,10 +1711,11 @@ class Downloader {
       dir: directory,
       filename: sanitizeFilename(request.filename ?? ''),
       threads: numberConfig(request.threads, this.defaultThreads, 1, MAX_THREADS),
+      threadsExplicit: request.threads !== undefined && request.threads !== null,
       singleThread: request.singleThread === undefined ? undefined : Boolean(request.singleThread),
       origin: request.origin === 'user' ? 'user' : 'agent',
       headers,
-      sha256,
+      checksum,
       doh,
       dohProvider,
       github,
@@ -1577,7 +1844,17 @@ const TOOL_PARAMETERS = {
     urls: { type: 'array', items: { type: 'string' }, description: '批量下载地址（最多 20 个），与 url 二选一。' },
     mirrors: { type: 'array', items: { type: 'string' }, description: '备用镜像地址；主地址失败或分片出错时轮换重试。' },
     headers: { type: 'object', additionalProperties: { type: 'string' }, description: '自定义请求头，如 Cookie / Referer / Authorization；禁止 Range 等下载器控制的头。' },
-    sha256: { type: 'string', description: '完成后校验的 SHA-256（64 位十六进制）。' },
+    sha256: { type: 'string', description: '兼容旧参数：完成后校验的 SHA-256（64 位十六进制）。新代码请用 checksum。' },
+    checksum: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        algorithm: { type: 'string', enum: ['md5', 'sha1', 'sha256', 'sha512', 'crc32'] },
+        value: { type: 'string', description: '十六进制校验值；长度随算法变化。' },
+      },
+      required: ['algorithm', 'value'],
+      description: '完成后校验文件；支持 md5/sha1/sha256/sha512/crc32。',
+    },
     id: { type: 'string', description: 'pause/resume/cancel/remove 时的任务 id。' },
     directory: { type: 'string', description: '保存目录，省略则用插件默认目录。' },
     filename: { type: 'string', description: '保存文件名，省略则由响应头或 URL 推断。' },
@@ -1613,6 +1890,22 @@ const TASK_SCHEMA = {
     dohProvider: { type: 'string' },
     github: { type: 'boolean' },
     forceDisplay: { type: 'boolean' },
+    checksum: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        algorithm: { type: 'string' },
+        value: { type: 'string' },
+      },
+    },
+    fingerprint: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        state: { type: 'string' },
+        note: { type: 'string' },
+      },
+    },
   },
 }
 
@@ -1637,6 +1930,8 @@ function makeTool(manager) {
           directory: { type: 'string' },
           defaultThreads: { type: 'integer' },
           agentAutonomy: { type: 'boolean' },
+          autoThreads: { type: 'boolean' },
+          fingerprintResume: { type: 'boolean' },
           silentEnabled: { type: 'boolean' },
           largeFileMb: { type: 'integer' },
           minThreadMb: { type: 'integer' },
@@ -1663,6 +1958,7 @@ function makeTool(manager) {
                 singleThread: input.singleThread,
                 headers: input.headers,
                 sha256: input.sha256,
+                checksum: input.checksum,
                 doh: input.doh,
                 dohProvider: input.dohProvider,
                 github: input.github,
@@ -1686,6 +1982,8 @@ function makeTool(manager) {
               directory: manager.root,
               defaultThreads: manager.defaultThreads,
               agentAutonomy: manager.agentAutonomy,
+              autoThreads: manager.autoThreads,
+              fingerprintResume: manager.fingerprintResume,
               silentEnabled: manager.silentEnabled,
               largeFileMb: manager.largeFileMb,
               minThreadMb: manager.minThreadMb,
@@ -1745,6 +2043,8 @@ function makeRoutes(manager) {
           minThreadMb: manager.minThreadMb,
           minThreadEnabled: manager.minThreadEnabled,
           agentAutonomy: manager.agentAutonomy,
+          autoThreads: manager.autoThreads,
+          fingerprintResume: manager.fingerprintResume,
           silentEnabled: manager.silentEnabled,
           rateLimitBytes: manager.rateLimitBytes,
           dohEnabled: manager.dohEnabled,
@@ -1780,6 +2080,7 @@ function makeRoutes(manager) {
             singleThread: body.singleThread,
             headers: body.headers,
             sha256: body.sha256,
+            checksum: body.checksum,
             doh: body.doh,
             dohProvider: body.dohProvider,
             github: body.github,
@@ -1872,7 +2173,7 @@ export const inject = ['tools', 'webServer']
 
 /** 每次模型请求注入的简短公告；工具被 restrict 隐藏时自动消失。 */
 const TOOL_GUIDANCE =
-  '多线程下载器：需要把 http/https 文件下载到这台机器时，使用 downloader 工具（action=add 新建，list 查看进度，pause/resume 断点续传，cancel/remove 清理）。下载在 Host 后台进行，不必等待完成；支持自定义请求头（Cookie/Referer/Authorization）、镜像回退、批量 URL、SHA-256 校验、分片重试与全局限速；可选 DoH 解析与 GitHub 资产解析；小于静默阈值（默认 16 MB，可关闭，关闭后显示全部任务）的文件静默下载，不在面板和对话中显示；达到阈值的任务显示进度曲线；小于单线程阈值（默认 4 MB）的文件单连接下载。用户手动下载（面板填 URL/目录/线程）始终显示并多线程；其余下载视为 Agent 任务，受静默/单线程阈值约束，Agent 自主模式下可由 Agent 指定线程策略。完整用法见 skill multithread-downloader。'
+  '多线程下载器：需要把 http/https 文件下载到这台机器时，使用 downloader 工具（action=add 新建，list 查看进度，pause/resume 断点续传，cancel/remove 清理）。下载在 Host 后台进行，不必等待完成；支持自定义请求头（Cookie/Referer/Authorization）、镜像回退、批量 URL、多算法校验、分片重试与全局限速；可选 DoH 解析与 GitHub 资产解析；小于静默阈值（默认 16 MB，可关闭，关闭后显示全部任务）的文件静默下载，不在面板和对话中显示；达到阈值的任务显示进度曲线；小于单线程阈值（默认 4 MB）的文件单连接下载，更大文件按大小自动 4/6/8 条连接（可显式指定 threads）。续传前与收尾都会用 ETag/Last-Modified 指纹复核，分片请求带 If-Range，远端换版本会自动从头重下。用户手动下载（面板填 URL/目录/线程）始终显示并多线程；其余下载视为 Agent 任务，受静默/单线程阈值约束，Agent 自主模式下可由 Agent 指定线程策略。完整用法见 skill multithread-downloader。'
 
 /** 注册给所有会话的技能正文（按需加载，不占常驻提示）。 */
 const SKILL_CONTENT = `# 多线程下载器（downloader）
@@ -1885,18 +2186,20 @@ const SKILL_CONTENT = `# 多线程下载器（downloader）
 
 ## 工具
 
-\`downloader({ action, url? | urls?, mirrors?, headers?, sha256?, id?, directory?, filename?, threads? })\`
+\`downloader({ action, url? | urls?, mirrors?, headers?, checksum?, sha256?, id?, directory?, filename?, threads? })\`
 
 ### action=add
 
 - \`url\` 必填，只支持 http/https。
 - \`directory\` 可选，Host 本机绝对路径；省略则用插件默认目录（Known Folder / 用户 Downloads）。面板里点“选择…”：Electron 桌面环境使用系统原生目录对话框（标题“选择下载目录”）；其他环境使用插件内目录浏览器（同样标题，支持面包屑与选择当前目录）。
 - \`filename\` 可选，只写文件名，不要带路径分隔符。
-- \`threads\` 可选，1..16，默认 4；服务器不支持 Range 时自动回退单连接。
+- \`threads\` 可选，1..16；省略时按大小自动（<32 MB 4 条、<256 MB 6 条、更大 8 条，可被 autoThreads 关闭），显式给出则固定；服务器不支持 Range 时自动回退单连接。
 - \`headers\` 可选对象：Cookie / Referer / Authorization 等；遇到 401/403 必须提供。
-- \`sha256\` 可选：完成后校验，不匹配则任务失败。
+- \`checksum\` 可选：\`{ algorithm, value }\`，algorithm 支持 md5/sha1/sha256/sha512/crc32，完成后校验，不匹配则任务失败。
+- \`sha256\` 可选：兼容旧参数，等价于 \`checksum: { algorithm: 'sha256', value }\`。
 - \`urls\` 可选数组：批量创建（最多 20 个），\`mirrors\` 为每个任务提供备用镜像。
 - 分片失败会自动重试（指数退避，最多 4 次），并对 5xx/429/超时生效。
+- 断点续传会先复核远端指纹（旁证文件 + Content-Length + ETag/Last-Modified），分片请求带 \`If-Range\`；远端换了版本会自动丢弃旧分片从头重下，收尾还会再核对一次，避免交付拼接文件。
 - 小于单线程阈值（默认 4 MB，可关闭）的文件只建一个分片、单连接下载。
 - \`singleThread\` 可选：true 强制单连接，false 强制分片；省略时普通模式按阈值，Agent 自主模式下默认分片。
 - \`doh\` 可选：true 让该任务走 DoH 解析；\`dohProvider\` 可选 cloudflare / alidns / tencent。
@@ -1970,6 +2273,8 @@ export function apply(ctx, config) {
     minThreadMb: numberConfig(config?.minThreadMb, DEFAULT_MIN_THREAD_MB, 0, 10240),
     minThreadEnabled: config?.minThreadEnabled !== false,
     agentAutonomy: config?.agentAutonomy !== false,
+    autoThreads: config?.autoThreads !== false,
+    fingerprintResume: config?.fingerprintResume !== false,
     silentEnabled: config?.silentEnabled !== false,
     rateLimitBytes: numberConfig(config?.rateLimitKb, 102400, 0, 1024 * 1024) * 1024,
     dohEnabled: config?.dohEnabled === true,
@@ -2037,4 +2342,4 @@ export function apply(ctx, config) {
 }
 
 /** 仅用于测试的纯函数导出；DSH 加载器会忽略额外命名导出。 */
-export const __test = { sanitizeHeaders, retryDelay, RateLimiter, probe, fetchWithRedirects, fileSha256, freeDiskBytes, defaultDownloadDirectory, parseGithubReleaseUrl, normalizeDohProvider, DOH_PROVIDERS }
+export const __test = { sanitizeHeaders, retryDelay, RateLimiter, probe, fetchWithRedirects, fileSha256, fileChecksum, normalizeChecksum, CHECKSUM_ALGORITHMS, freeDiskBytes, defaultDownloadDirectory, parseGithubReleaseUrl, normalizeDohProvider, DOH_PROVIDERS, autoThreadsForBytes, fingerprintChange, ifRangeValue, DownloadTask }

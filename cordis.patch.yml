@@ -7,6 +7,8 @@
         silentEnabled: true
         minThreadMb: 4
         minThreadEnabled: true
+        autoThreads: true
+        fingerprintResume: true
         agentAutonomy: true
         rateLimitKb: 102400
         dohEnabled: false

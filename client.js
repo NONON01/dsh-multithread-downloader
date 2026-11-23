@@ -34,7 +34,9 @@ window.__ModuleLoader__.load({
       'form.advanced': '高级选项（请求头 / 校验 / 批量）',
       'form.headers': '请求头，每行 Key: value',
       'form.headersPlaceholder': 'Cookie: a=b\nReferer: https://example.com/',
-      'form.sha256': 'SHA-256（可选，64 位十六进制）',
+      'form.checksum': '校验值（可选，十六进制）',
+      'form.checksumAlgorithm': '校验算法',
+      'form.checksumValue': '校验值',
       'form.batch': '批量 URL（每行一个，最多 20 个；填写后忽略上方地址）',
       'form.batchPlaceholder': 'https://example.com/a.zip\nhttps://example.com/b.zip',
       'form.batchTooMany': '一次最多批量添加 20 个地址',
@@ -92,6 +94,12 @@ window.__ModuleLoader__.load({
       'settings.minThreadInvalid': '请输入 0 – 10 GB 之间的数值',
       'settings.unit': '单位',
       'settings.minThreadEnabled': '启用单线程阈值',
+      'settings.autoThreads': '自动分片数',
+      'settings.autoThreadsHint': '按大小自动选 4/6/8 条连接；显式指定线程数时以指定值为准',
+      'settings.autoThreadsOffHint': '已关闭：统一使用面板上的线程数',
+      'settings.fingerprintResume': '续传指纹校验',
+      'settings.fingerprintResumeHint': '续传前与收尾核对 ETag/Last-Modified，分片请求带 If-Range；远端换版本会自动从头重下',
+      'settings.fingerprintResumeOffHint': '已关闭：只按文件大小判断，远端换版本可能拼出混合文件',
       'settings.agentAutonomy': 'Agent 自主模式',
       'settings.agentAutonomyHint': '开启后阈值设置屏蔽但继续约束 Agent 任务；面板手动下载不受限制',
       'badge.unfinished': '{count} 个未完成任务',
@@ -126,7 +134,9 @@ window.__ModuleLoader__.load({
       'form.advanced': 'Advanced (headers / checksum / batch)',
       'form.headers': 'Request headers, one Key: value per line',
       'form.headersPlaceholder': 'Cookie: a=b\nReferer: https://example.com/',
-      'form.sha256': 'SHA-256 (optional, 64 hex chars)',
+      'form.checksum': 'Checksum (optional, hex)',
+      'form.checksumAlgorithm': 'Checksum algorithm',
+      'form.checksumValue': 'Checksum value',
       'form.batch': 'Batch URLs, one per line, max 20; overrides the URL above',
       'form.batchPlaceholder': 'https://example.com/a.zip\nhttps://example.com/b.zip',
       'form.batchTooMany': '一次最多批量添加 20 个地址',
@@ -188,6 +198,12 @@ window.__ModuleLoader__.load({
       'settings.minThreadInvalid': 'Enter a value between 0 and 10 GB',
       'settings.unit': 'Unit',
       'settings.minThreadEnabled': 'Enable single-connection threshold',
+      'settings.autoThreads': 'Automatic thread count',
+      'settings.autoThreadsHint': 'Picks 4/6/8 connections by size; an explicit threads value still wins',
+      'settings.autoThreadsOffHint': 'Off: always use the panel thread count',
+      'settings.fingerprintResume': 'Resume fingerprint check',
+      'settings.fingerprintResumeHint': 'Checks ETag/Last-Modified before resuming and at the end; chunk requests carry If-Range, and a changed remote file restarts the download',
+      'settings.fingerprintResumeOffHint': 'Off: only the file size is compared, so a changed remote file can mix versions',
       'settings.agentAutonomy': 'Agent autonomy',
       'settings.agentAutonomyHint': 'Threshold settings are masked but still govern agent tasks; manual panel downloads are unrestricted',
       'badge.unfinished': '{count} unfinished downloads',
@@ -260,6 +276,7 @@ window.__ModuleLoader__.load({
 .mtd-url { flex: 1 1 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-secondary); font-size: 11px; font-family: var(--ds-font-family-code, ui-monospace, SFMono-Regular, Menlo, monospace); }
 .mtd-actions { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
 .mtd-task-error { margin-top: 8px; color: var(--dsw-alias-state-error-primary); font-size: 11.5px; overflow-wrap: anywhere; }
+.mtd-task-note { margin-top: 8px; opacity: .75; font-size: 11.5px; overflow-wrap: anywhere; }
 .mtd-modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; padding: 24px; background: color-mix(in srgb, #000 35%, transparent); }
 .mtd-modal-card { display: flex; flex-direction: column; width: min(560px, 100%); max-height: min(70vh, 600px); overflow: hidden; background: var(--dsw-alias-bg-overlay); border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px; box-shadow: 0 18px 50px rgba(0, 0, 0, .25); }
 .mtd-modal-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
@@ -310,6 +327,8 @@ button:has(> span > .mtd-icon) { position: relative; }
 .mtd-dock-seg { display: block; min-width: 3px; height: 100%; border-radius: 2px; background: color-mix(in srgb, var(--dsw-alias-label-secondary) 22%, transparent); box-shadow: inset 0 0 0 .5px color-mix(in srgb, var(--dsw-alias-label-secondary) 35%, transparent); overflow: hidden; }
 .mtd-dock-seg-fill { display: block; height: 100%; border-radius: inherit; background: var(--dsw-alias-brand-primary); transition: width .3s ease; }
 @media (prefers-reduced-motion: reduce) { .mtd-dock-seg-fill { transition: none; } }
+.mtd-checksum-row { display: flex; gap: 8px; align-items: stretch; }
+.mtd-checksum-select { flex: 0 0 110px; }
 .mtd-chart-waiting { color: var(--dsw-alias-label-secondary); font-size: 11px; }
 .mtd-chart { margin-top: 10px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-2); border-radius: 8px; padding: 8px 10px 6px; }
 .mtd-chart-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; margin-bottom: 4px; }
@@ -660,6 +679,9 @@ button:has(> span > .mtd-icon) { position: relative; }
             : null,
         h('div', { className: 'mtd-url', title: task.path || task.url }, task.path || task.url),
         task.status === 'failed' && task.error !== '' ? h('div', { className: 'mtd-task-error' }, task.error) : null,
+        task.fingerprint !== undefined && typeof task.fingerprint.note === 'string' && task.fingerprint.note !== ''
+          ? h('div', { className: 'mtd-task-note' }, task.fingerprint.note)
+          : null,
       )
     }
 
@@ -809,6 +831,8 @@ button:has(> span > .mtd-icon) { position: relative; }
       const [minThreadUnit, setMinThreadUnit] = React.useState('MB')
       const [silentEnabled, setSilentEnabled] = React.useState(true)
       const [minThreadEnabled, setMinThreadEnabled] = React.useState(true)
+      const [autoThreads, setAutoThreads] = React.useState(true)
+      const [fingerprintResume, setFingerprintResume] = React.useState(true)
       const [agentAutonomy, setAgentAutonomy] = React.useState(false)
       const [dohEnabled, setDohEnabled] = React.useState(false)
       const [dohProvider, setDohProvider] = React.useState('alidns')
@@ -817,7 +841,8 @@ button:has(> span > .mtd-icon) { position: relative; }
       const [rate, setRate] = React.useState('0')
       const [concurrency, setConcurrency] = React.useState('3')
       const [headersText, setHeadersText] = React.useState('')
-      const [sha256, setSha256] = React.useState('')
+      const [checksumAlgorithm, setChecksumAlgorithm] = React.useState('sha256')
+      const [checksum, setChecksum] = React.useState('')
       const [batch, setBatch] = React.useState('')
       const downloads = useDownloads((message) => setError(fill(t('error.request'), { message })))
 
@@ -855,6 +880,12 @@ button:has(> span > .mtd-icon) { position: relative; }
       React.useEffect(() => {
         if (meta !== null && meta.minThreadEnabled !== undefined) setMinThreadEnabled(Boolean(meta.minThreadEnabled))
       }, [meta === null ? undefined : meta.minThreadEnabled])
+      React.useEffect(() => {
+        if (meta !== null && meta.autoThreads !== undefined) setAutoThreads(Boolean(meta.autoThreads))
+      }, [meta === null ? undefined : meta.autoThreads])
+      React.useEffect(() => {
+        if (meta !== null && meta.fingerprintResume !== undefined) setFingerprintResume(Boolean(meta.fingerprintResume))
+      }, [meta === null ? undefined : meta.fingerprintResume])
       React.useEffect(() => {
         if (meta !== null && meta.agentAutonomy !== undefined) setAgentAutonomy(Boolean(meta.agentAutonomy))
       }, [meta === null ? undefined : meta.agentAutonomy])
@@ -917,7 +948,9 @@ button:has(> span > .mtd-icon) { position: relative; }
               directory: directory.trim(),
               threads: Number(threads),
               headers,
-              sha256: targets.length === 1 ? sha256.trim() : '',
+              checksum: targets.length === 1 && checksum.trim() !== ''
+                ? { algorithm: checksumAlgorithm, value: checksum.trim() }
+                : undefined,
               origin: 'user',
             })
           }
@@ -1137,14 +1170,37 @@ button:has(> span > .mtd-icon) { position: relative; }
                 placeholder: t('form.headersPlaceholder'),
                 onChange: (event) => setHeadersText(event.target.value),
               }),
-              h('label', { className: 'mtd-advanced-label' }, t('form.sha256')),
-              h('input', {
-                className: 'mtd-input',
-                type: 'text',
-                value: sha256,
-                placeholder: 'e3b0c442...',
-                onChange: (event) => setSha256(event.target.value),
-              }),
+              h('label', { className: 'mtd-advanced-label' }, t('form.checksum')),
+              h(
+                'div',
+                { className: 'mtd-checksum-row' },
+                h(
+                  'select',
+                  {
+                    className: 'mtd-input mtd-checksum-select',
+                    value: checksumAlgorithm,
+                    'aria-label': t('form.checksumAlgorithm'),
+                    onChange: (event) => setChecksumAlgorithm(event.target.value),
+                  },
+                  ['sha256', 'sha512', 'sha1', 'md5', 'crc32'].map((algorithm) =>
+                    h('option', { key: algorithm, value: algorithm }, algorithm.toUpperCase()),
+                  ),
+                ),
+                h('input', {
+                  className: 'mtd-input',
+                  type: 'text',
+                  value: checksum,
+                  placeholder: {
+                    md5: '32 位十六进制',
+                    sha1: '40 位十六进制',
+                    sha256: '64 位十六进制',
+                    sha512: '128 位十六进制',
+                    crc32: '8 位十六进制',
+                  }[checksumAlgorithm],
+                  'aria-label': t('form.checksumValue'),
+                  onChange: (event) => setChecksum(event.target.value),
+                }),
+              ),
               h('label', { className: 'mtd-advanced-label' }, t('form.batch')),
               h('textarea', {
                 className: 'mtd-input mtd-advanced-text',
@@ -1253,6 +1309,42 @@ button:has(> span > .mtd-icon) { position: relative; }
                   h('option', { value: 'MB' }, 'MB'),
                 ),
                 h('span', { className: 'mtd-setting-hint' }, minThreadEnabled ? t('settings.minThreadHint') : t('settings.minThreadOffHint')),
+              ),
+              h(
+                'div',
+                { className: 'mtd-setting-row' },
+                h(
+                  'label',
+                  { className: 'mtd-switch-row' },
+                  h(Toggle, {
+                    checked: autoThreads,
+                    label: t('settings.autoThreads'),
+                    onChange: (next) => {
+                      setAutoThreads(next)
+                      void saveFlags({ autoThreads: next })
+                    },
+                  }),
+                  h('span', null, t('settings.autoThreads')),
+                ),
+                h('span', { className: 'mtd-setting-hint' }, autoThreads ? t('settings.autoThreadsHint') : t('settings.autoThreadsOffHint')),
+              ),
+              h(
+                'div',
+                { className: 'mtd-setting-row' },
+                h(
+                  'label',
+                  { className: 'mtd-switch-row' },
+                  h(Toggle, {
+                    checked: fingerprintResume,
+                    label: t('settings.fingerprintResume'),
+                    onChange: (next) => {
+                      setFingerprintResume(next)
+                      void saveFlags({ fingerprintResume: next })
+                    },
+                  }),
+                  h('span', null, t('settings.fingerprintResume')),
+                ),
+                h('span', { className: 'mtd-setting-hint' }, fingerprintResume ? t('settings.fingerprintResumeHint') : t('settings.fingerprintResumeOffHint')),
               ),
               h(
                 'div',

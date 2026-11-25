@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -1095,6 +1095,105 @@ test('pause then immediate resume leaves one run, no stale error, exact bytes', 
     assert.equal(task.receivedBytes, body.length)
     const onDisk = await readFile(task.path)
     assert.equal(onDisk.length, body.length)
+  } finally {
+    server.closeAllConnections?.()
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('pausing during the probe then resuming leaves exactly one live run', async () => {
+  // run()（探测→建文件→建分片）以前不持有 run 令牌：暂停落在探测阶段时 resume() 会再起
+  // 一个 run()，两个 run() 各自打开 .mtd-part、各自覆盖 chunks，先跑完的那个 rename 掉临时
+  // 文件，另一个再 open 就是 ENOENT。用慢 HEAD 稳定地把暂停压在探测阶段。
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-probe-race-'))
+  const body = Buffer.alloc(512 * 1024, 7)
+  const { server, port } = await listen((req, res) => {
+    if (req.method === 'HEAD') {
+      setTimeout(() => {
+        if (!res.writableEnded) {
+          res.writeHead(200, { 'content-length': String(body.length), 'accept-ranges': 'bytes' }).end()
+        }
+      }, 200)
+      return
+    }
+    const match = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '')
+    const start = match === null ? 0 : Number(match[1])
+    const end = match === null || match[2] === '' ? body.length - 1 : Number(match[2])
+    res.writeHead(206, {
+      'content-length': String(end - start + 1),
+      'content-range': `bytes ${start}-${end}/${body.length}`,
+    })
+    res.end(body.subarray(start, end + 1))
+  })
+  try {
+    const manager = stubManager(directory)
+    const task = makeTask(manager, `http://127.0.0.1:${port}/file.bin`, { threads: 2, singleThread: false })
+    task.status = 'probing'
+    const firstRun = task.run().catch(() => {})
+    await new Promise((done) => setTimeout(done, 40))
+    task.pause()
+    task.resume()
+    await firstRun
+    for (let index = 0; index < 400 && task.status !== 'completed' && task.status !== 'failed'; index += 1) {
+      await new Promise((done) => setTimeout(done, 25))
+    }
+    assert.equal(task.error, '', '探测阶段暂停再恢复不得留下错误')
+    assert.equal(task.status, 'completed')
+    const onDisk = await readFile(task.path)
+    assert.equal(onDisk.length, body.length)
+    assert.deepEqual(onDisk, body)
+  } finally {
+    server.closeAllConnections?.()
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('resuming after the part file disappeared restarts instead of failing', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-part-gone-'))
+  const body = Buffer.alloc(512 * 1024, 8)
+  const { server, port } = await listen((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-length': String(body.length), 'accept-ranges': 'bytes' }).end()
+      return
+    }
+    const match = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '')
+    const start = match === null ? 0 : Number(match[1])
+    const end = match === null || match[2] === '' ? body.length - 1 : Number(match[2])
+    res.writeHead(206, {
+      'content-length': String(end - start + 1),
+      'content-range': `bytes ${start}-${end}/${body.length}`,
+    })
+    const slice = body.subarray(start, end + 1)
+    let offset = 0
+    const timer = setInterval(() => {
+      if (offset >= slice.length) {
+        clearInterval(timer)
+        res.end()
+        return
+      }
+      res.write(slice.subarray(offset, offset + 32 * 1024))
+      offset += 32 * 1024
+    }, 20)
+    res.on('close', () => clearInterval(timer))
+  })
+  try {
+    const manager = stubManager(directory)
+    const task = makeTask(manager, `http://127.0.0.1:${port}/file.bin`, { threads: 2, singleThread: false })
+    task.status = 'probing'
+    const firstRun = task.run().catch(() => {})
+    await new Promise((done) => setTimeout(done, 120))
+    task.pause()
+    await firstRun
+    await unlink(task.partPath).catch(() => {})
+    task.resume()
+    for (let index = 0; index < 400 && task.status !== 'completed' && task.status !== 'failed'; index += 1) {
+      await new Promise((done) => setTimeout(done, 25))
+    }
+    assert.equal(task.error, '', '临时文件消失应触发从头重下，而不是 ENOENT')
+    assert.equal(task.status, 'completed')
+    assert.deepEqual(await readFile(task.path), body)
   } finally {
     server.closeAllConnections?.()
     await close(server)

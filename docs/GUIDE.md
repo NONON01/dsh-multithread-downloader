@@ -1,6 +1,6 @@
 # 多线程下载器（DSH 插件）完整说明
 
-> 版本：1.4.0  
+> 版本：1.4.1  
 > 仓库：https://github.com/NONON01/dsh-multithread-downloader  
 > npm：https://www.npmjs.com/package/dsh-multithread-downloader  
 > 最低 DSH：`>=0.2.1-rc.2`；最低 Node：`>=22`
@@ -734,9 +734,9 @@ CI：GitHub Actions，Node 22 / 24，Linux / Windows / macOS。
 
 ## 版本与发布
 
-- 当前版本：**1.4.0**
-- npm：`latest = 1.4.0`
-- GitHub Release：`v1.4.0`
+- 当前版本：**1.4.1**
+- npm：`latest = 1.4.1`
+- GitHub Release：`v1.4.1`
 - 历史版本：
   - 1.3.1：修复审查发现的问题（416 空转、任务恢复、原生目录选择器、暂停后立即恢复的竞态、正文空闲超时）
   - 1.3.0：多算法校验、`forceDisplay`、`http_probe`

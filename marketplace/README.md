@@ -12,9 +12,9 @@
 | GitHub 简介 | 部分目录要求 | ⚠️ 有，但可以更具体（见下） |
 | 仓库创建满 1 天 | awesome-dsh-plugin 硬性 | ✅ 2026-10-25 创建，已 31 天 |
 | Star > 10 | awesome-dsh-plugin-pro 自荐硬性 | ❌ 当前 0，暂不投 pro |
-| npm 已发布 | 1024 Store 才显示安装命令；无也能「仅浏览」收录 | ✅ npm `latest = 1.4.0`，GitHub Release `v1.4.0` 已发布 |
+| npm 已发布 | 1024 Store 才显示安装命令；无也能「仅浏览」收录 | ✅ npm `latest = 1.4.1`，GitHub Release `v1.4.1` 已发布 |
 
-**现状**：远程 `main`、npm、GitHub Release 都已是 1.4.0（2026-11-26）。下面三份描述里提到的 `doh_lookup` / `http_probe` / ETA 都能在代码里核实，可以按顺序投了。
+**现状**：远程 `main`、npm、GitHub Release 都已是 1.4.1（2026-11-26）。下面三份描述里提到的 `doh_lookup` / `http_probe` / ETA 都能在代码里核实，可以按顺序投了。
 
 ## 一、awesome-dsh-plugin（25.6k star，最核心，必投）
 

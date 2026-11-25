@@ -422,8 +422,27 @@ class DownloadTask {
   }
 
   async run() {
+    // 与分片循环共用令牌：暂停发生在探测阶段、随后立刻 resume 时，会再起一个 run()，
+    // 旧 run() 必须能在每个 await 之后发现自己已被取代，否则两轮会各自打开 .mtd-part、
+    // 各自覆盖 this.chunks，先完成的那轮 rename 掉临时文件，另一轮再 open 就是 ENOENT。
+    const run = Symbol('run')
+    this.runToken = run
+    try {
+      await this.runBody(run)
+    } catch (error) {
+      // 暂停会 abort 掉在途的探测请求，旧轮抛出的 AbortError 不是任务失败，
+      // 也不能在 resume 之后被记到新一轮头上。
+      if (this.runToken !== run) return
+      throw error
+    }
+  }
+
+  async runBody(run) {
+    // 每次 run() 都要换新的控制器：pause() 会 abort 掉上一轮的，复用会让新探测
+    // 立刻以 AbortError 失败（表现为「暂停后再恢复，任务直接失败」）。
+    this.abort = new AbortController()
     const result = await this.probeAny()
-    if (this.status !== 'probing') return
+    if (this.runToken !== run || this.status !== 'probing') return
     this.totalBytes = result.size
     this.etag = result.etag ?? ''
     this.lastModified = result.lastModified ?? ''
@@ -431,29 +450,36 @@ class DownloadTask {
     const safeName = sanitizeFilename(chosen) || `download-${this.id}.bin`
     if (this.path === '') {
       await mkdir(this.dir, { recursive: true })
+      if (this.runToken !== run) return
       this.filename = await this.manager.reserveName(this.dir, safeName)
+      if (this.runToken !== run) return
       this.path = join(this.dir, this.filename)
       this.partPath = `${this.path}.mtd-part`
     }
     await mkdir(this.dir, { recursive: true })
+    if (this.runToken !== run) return
     if (this.totalBytes > 0) {
       const free = await freeDiskBytes(this.dir)
+      if (this.runToken !== run) return
       if (free !== null && free < this.totalBytes + DISK_MARGIN_BYTES) {
         throw new Error(`磁盘空间不足：需要 ${this.totalBytes + DISK_MARGIN_BYTES} 字节，可用 ${free} 字节`)
       }
     }
+    // 打开临时文件前再确认一次，避免「已暂停」的任务把文件重新建出来。
+    if (this.runToken !== run || this.status !== 'probing') return
     this.handle = await open(this.partPath, 'w+')
     if (this.totalBytes > 0) await this.handle.truncate(this.totalBytes)
     this.chunks = this.buildChunks(result)
     this.fingerprintState = this.hasValidator() ? 'verified' : ''
     this.fingerprintNote = ''
     await this.writeMeta()
+    if (this.runToken !== run || this.status !== 'probing') return
     this.status = 'downloading'
     this.startedAt = this.startedAt || Date.now()
     if (this.manager.shouldDisplay(this) && this.history.length === 0) {
       this.history = [{ t: 0, p: 0, s: 0 }]
     }
-    await this.runChunks()
+    await this.runChunks(run)
   }
 
   buildChunks(result) {
@@ -758,9 +784,12 @@ class DownloadTask {
   /**
    * 一轮下载。用令牌标记本轮：pause 后立刻 resume 会开新一轮，旧轮的循环与收尾
    * 发现令牌被换掉就安静退出，不会去 finalize/fail 别人的句柄与状态。
+   * 传入 expected 表示由 run() 带着令牌进来：令牌已变（被暂停或换轮）就直接退出，
+   * 否则暂停中的任务会被旧 run() 重新激活。
    */
-  async runChunks() {
-    const run = Symbol('run')
+  async runChunks(expected) {
+    if (expected !== undefined && this.runToken !== expected) return
+    const run = expected ?? Symbol('run')
     this.runToken = run
     try {
       await this.runChunksBody(run)
@@ -777,7 +806,18 @@ class DownloadTask {
     // 续传前核对旁证 / 大小 / ETag / Last-Modified，变化则从头下载，避免拼出混合内容。
     if (this.chunks.some((chunk) => chunk.cursor > 0)) await this.revalidate()
     if (this.runToken !== run || this.status !== 'downloading') return
-    if (this.handle === null) this.handle = await open(this.partPath, 'r+')
+    if (this.handle === null) {
+      this.handle = await open(this.partPath, 'r+').catch(async (error) => {
+        if (error?.code !== 'ENOENT') throw error
+        // 续传前临时文件已不在（被外部清理或上一轮收尾带走）：游标全部作废，从 0 重来，
+        // 而不是把一个 ENOENT 抛成任务失败。
+        for (const chunk of this.chunks) chunk.cursor = 0
+        this.receivedBytes = 0
+        this.progress = 0
+        this.resetFile = true
+        return open(this.partPath, 'w+')
+      })
+    }
     if (this.resetFile) {
       const truncateTo = this.chunks.length === 1 && this.chunks[0].end < 0 ? 0 : this.totalBytes
       await this.handle.truncate(truncateTo)
@@ -936,7 +976,18 @@ class DownloadTask {
       this.status = 'downloading'
       void (async () => {
         try {
-          const handle = await open(this.partPath, 'r+')
+          // 临时文件可能已被 cancel/remove 或上一轮收尾清掉：这时没有可续传的字节，
+          // 退回去重新探测、从头下载，而不是把一个 ENOENT 记成任务失败。
+          const handle = await open(this.partPath, 'r+').catch((error) => {
+            if (error?.code === 'ENOENT') return null
+            throw error
+          })
+          if (handle === null) {
+            this.chunks = []
+            this.status = 'probing'
+            await this.run()
+            return
+          }
           await handle.truncate(this.totalBytes)
           await handle.close()
           this.chunks = this.chunks.map((chunk) => ({ ...chunk, cursor: 0 }))

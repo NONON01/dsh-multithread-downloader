@@ -1,6 +1,6 @@
 # 多线程下载器（DSH 插件）完整说明
 
-> 版本：1.1.2  
+> 版本：1.4.0  
 > 仓库：https://github.com/NONON01/dsh-multithread-downloader  
 > npm：https://www.npmjs.com/package/dsh-multithread-downloader  
 > 最低 DSH：`>=0.2.1-rc.2`；最低 Node：`>=22`
@@ -17,18 +17,21 @@
 6. [Agent 下载与自主模式](#agent-下载与自主模式)
 7. [阈值与显示规则](#阈值与显示规则)
 8. [设置项](#设置项)
-9. [DoH 解析模式](#doh-解析模式)
-10. [GitHub 模式](#github-模式)
-11. [请求头、校验、镜像与批量](#请求头校验镜像与批量)
-12. [断点续传与任务持久化](#断点续传与任务持久化)
-13. [Agent 工具 API](#agent-工具-api)
-14. [本地 HTTP API](#本地-http-api)
-15. [文件与路径](#文件与路径)
-16. [安全说明](#安全说明)
-17. [限制与非目标](#限制与非目标)
-18. [故障排查](#故障排查)
-19. [开发与测试](#开发与测试)
-20. [版本与发布](#版本与发布)
+9. [负载与站点自适应](#负载与站点自适应)
+10. [DoH 解析模式](#doh-解析模式)
+11. [GitHub 模式](#github-模式)
+12. [请求头、校验、镜像与批量](#请求头校验镜像与批量)
+13. [断点续传与任务持久化](#断点续传与任务持久化)
+14. [Agent 工具 API](#agent-工具-api)
+15. [配套工具：doh_lookup 与 http_probe](#配套工具doh_lookup-与-http_probe)
+16. [作为模块复用](#作为模块复用)
+17. [本地 HTTP API](#本地-http-api)
+18. [文件与路径](#文件与路径)
+19. [安全说明](#安全说明)
+20. [限制与非目标](#限制与非目标)
+21. [故障排查](#故障排查)
+22. [开发与测试](#开发与测试)
+23. [版本与发布](#版本与发布)
 
 ---
 
@@ -59,7 +62,9 @@
 - 分片重试：指数退避，响应头超时 30 秒
 - 镜像回退、批量 URL
 - 可选多算法校验（SHA-256 / SHA-512 / SHA-1 / MD5 / CRC32）、下载前磁盘空间检查
-- 全局限速（默认 100 MB/s）与同时任务数（默认 3）
+- 全局限速（默认 100 MB/s）与并发限制数（默认 16 条连接，= 任务数 × 线程数；超出排队，Agent 自主模式同样受约束）
+- 设备负载自适应：每 2 秒采样 CPU/内存，高负载立即收缩连接预算，回落逐步恢复
+- 站点风控自适应：403/429/503 后按站点降并发 + 聚合限速 + 冷却重试，站点之间互不影响
 - 可选 DoH 解析（Cloudflare / AliDNS / Tencent）
 - GitHub Release 直链自动转 API 资产链接
 - `forceDisplay` 强制显示低于静默阈值的任务，并显示速度曲线
@@ -105,9 +110,14 @@ link:F:\DSH_Work\multithread-downloader
 ### 侧边栏面板
 
 - 新建下载：URL、保存目录、线程数、开始下载
-- 高级选项：请求头、SHA-256、批量 URL
-- 设置：静默阈值、单线程阈值、Agent 自主模式、DoH、GitHub 模式、全局限速、同时任务数
-- 任务列表：状态、进度、速度、大小、操作按钮
+- 高级选项：请求头、校验算法与校验值、批量 URL
+- **设置**：面板底部一张可折叠卡片，默认收起；标题栏显示当前关键值（并发、限速、静默阈值、DoH 状态），点标题展开。展开后按四组排列：
+  - **连接与带宽**：并发限制数、全局限速、设备负载自适应
+  - **下载与续传**：自动分片数、续传指纹校验
+  - **Agent 与阈值**：Agent 自主模式、静默下载阈值、单线程阈值
+  - **网络与站点**：站点风控自适应、DoH 解析与提供商、GitHub 模式
+- 任务列表：状态、进度、速度、**剩余时间（ETA）**、大小、操作按钮
+- 统计栏显示进行中/已完成/总速度/预计剩余/任务数/连接数 x/y
 - 大文件任务显示速度曲线
 
 ### 对话进度条
@@ -118,6 +128,7 @@ link:F:\DSH_Work\multithread-downloader
 - 已下载 / 总大小
 - 百分比
 - 当前速度
+- 预计剩余时间（速度有效时）
 - 分段进度条（多任务时按任务大小切段）
 - 收起/恢复按钮
 
@@ -193,17 +204,21 @@ Agent 通过 `downloader` 工具创建的任务视为 **Agent 下载**：
 
 ## 设置项
 
-| 设置 | 默认 | 范围 / 说明 |
-|---|---|---|
-| 静默下载阈值 | 16 MB | 1 KB–10 GB；可开关 |
-| 单线程阈值 | 4 MB | 0–10 GB；可开关 |
-| 自动分片数 | 开启 | 按大小 4/6/8；显式 threads 优先 |
-| 续传指纹校验 | 开启 | 续传/收尾核对 ETag、Last-Modified、If-Range |
-| Agent 自主模式 | 开启 | 阈值设置置灰但继续生效 |
-| DoH 解析 | 关闭 | Cloudflare / AliDNS / Tencent |
-| GitHub 模式 | 关闭 | GitHub Release 直链转 API 资产 |
-| 全局限速 | 100 MB/s | 0 表示不限 |
-| 同时下载任务数 | 3 | 1–8，超出排队 |
+所有设置都在面板底部的「设置」卡片里，按四组分类；卡片收起时右侧显示 `并发 n · 限速 · 静默阈值 · DoH 状态` 摘要。
+
+| 分组 | 设置 | 默认 | 范围 / 说明 |
+|---|---|---|---|
+| 连接与带宽 | 并发限制数 | 16 | 1–64；连接数 = 任务数 × 线程数，超出排队，Agent 不能绕过 |
+| 连接与带宽 | 全局限速 | 100 MB/s | 0 表示不限 |
+| 连接与带宽 | 设备负载自适应 | 开启 | 高负载收缩连接预算，空闲逐步恢复 |
+| 下载与续传 | 自动分片数 | 开启 | 按大小 4/6/8；显式 threads 优先 |
+| 下载与续传 | 续传指纹校验 | 开启 | 续传/收尾核对 ETag、Last-Modified、If-Range |
+| Agent 与阈值 | Agent 自主模式 | 开启 | 阈值设置置灰但继续生效 |
+| Agent 与阈值 | 静默下载阈值 | 16 MB | 1 KB–10 GB；可开关 |
+| Agent 与阈值 | 单线程阈值 | 4 MB | 0–10 GB；可开关 |
+| 网络与站点 | 站点风控自适应 | 开启 | 403/429/503 后按站点降档、限速、冷却 |
+| 网络与站点 | DoH 解析 | 关闭 | Cloudflare / AliDNS / Tencent；开启前弹风险确认 |
+| 网络与站点 | GitHub 模式 | 关闭 | GitHub Release 直链转 API 资产 |
 
 设置保存在 profile 目录的：
 
@@ -211,10 +226,53 @@ Agent 通过 `downloader` 工具创建的任务视为 **Agent 下载**：
 multithread-downloader.json
 ```
 
-当前配置版本：9。
+当前配置版本：12。
 
 ---
 
+## 负载与站点自适应
+
+两项策略都在用户设置里，Agent 工具没有开关，也不能绕过。
+
+### 设备负载自适应（默认开）
+
+每 2 秒采样一次系统 CPU 与内存，压力 = max(CPU 使用率, 内存使用率)：
+
+| 压力 | 档位 | 实际连接预算 |
+|---|---|---|
+| < 55% | 正常 | 设定值 |
+| 55–70% | 偏高 | 80% |
+| 70–85% | 高 | 60% |
+| 85–95% | 高 | 35% |
+| ≥ 95% | 紧张 | 20%（至少 1） |
+
+- **收缩立即生效**：压力一过阈值，连接预算当次采样就下调，不等下一个周期。
+- **恢复逐步进行**：压力回落到 55% 以下并连续两个采样周期后，每两周期抬一档（约设定值的 1/8），约半分钟回到满速（默认上限 16 时约 28 秒）。
+- 预算同时决定活跃任务数上限，所以高负载时排队任务会自然变少。
+- 面板统计里的「连接 used/effective」显示实际生效值；「负载」一段显示 CPU、内存与档位。
+- 关闭后始终按设定值分配连接。
+
+### 站点风控自适应（默认开）
+
+站点按**注册域**归并：`cdn.example.com`、`www.example.com`、`example.com/a`、`example.com/b` 属于同一个站点；`a.example.com.cn`、`bbc.co.uk` 这类两级后缀按三段处理；GitHub 的 `api.github.com` / `objects.githubusercontent.com` 统一算 `github.com`。这样同站不同页面不会各自计数、轮番撞风控。
+
+命中 403 / 429 / 503 时：
+
+| 档位 | 站点并发 | 站点聚合限速 | 冷却 |
+|---|---|---|---|
+| L1 | 4 | 2 MB/s | 3 s |
+| L2 | 2 | 768 KB/s | 8 s |
+| L3 | 1 | 256 KB/s | 20 s |
+| L4 | 1 | 128 KB/s | 60 s |
+
+- 同一波并发分片同时拿到 403 只算一次降档（2 秒去重窗口），不会一次降到最低档。
+- 冷却在**槽位之外**等待：被风控站点的等待不占全局连接，其它站点照常下载。
+- 下载进度不丢：降档后按各分片断点继续，不重新下载已收到的字节。
+- 连续成功若干段后逐档回落到正常（每档需 24 × 档位 段）。
+- 单任务最多降档重试 3 次；仍被拒绝则失败并说明「站点已限速重试 N 次」。
+- 不同站点各自独立；面板「站点限速」列出当前被限速的站点、档位、并发、限速与剩余冷却。
+
+---
 ## DoH 解析模式
 
 DoH（DNS over HTTPS）把 DNS 查询封装在 HTTPS 中，用于绕过被污染的本地 DNS。
@@ -295,9 +353,9 @@ https://github.com/<owner>/<repo>/releases/download/<tag>/<file>
 - 401/403/407 会提示需要提供 Cookie / Referer / Authorization
 - 请求头会随未完成任务以**明文**保存在 profile 目录
 
-### SHA-256
+### 校验
 
-- 工具参数：`sha256`
+- 工具参数：`checksum: { algorithm, value }`，算法支持 `md5` / `sha1` / `sha256` / `sha512` / `crc32`；旧参数 `sha256` 仍兼容
 - 完成后流式计算校验
 - 不匹配则任务失败，保留 `.mtd-part`
 
@@ -372,8 +430,9 @@ multithread-downloader-tasks.json
 | `dohProvider` | string | `cloudflare` / `alidns` / `tencent` |
 | `github` | bool | 该任务启用 GitHub 模式 |
 | `forceDisplay` | bool | 覆盖静默阈值强制显示 |
-| `id` | string | 控制任务时的任务 ID |
+| `id` | string | 控制任务时的任务 ID；`list` 时只返回该任务 |
 | `limit` | int | `list` 返回条数，1–100，默认 20 |
+| `waitSeconds` | int | `list` 时最多等多少秒（0–300，默认 0）：任务结束或超时后返回一次，替代反复轮询 |
 
 ### 示例
 
@@ -404,6 +463,12 @@ multithread-downloader-tasks.json
 { "action": "list", "limit": 10 }
 ```
 
+```json
+{ "action": "list", "id": "a1b2c3d4", "waitSeconds": 120 }
+```
+
+`waitSeconds` 适合「要等下载完成再继续」的场景：调用会阻塞到任务结束或超时，返回时 `waitedSeconds` 告诉你实际等了多久。不要用连续 `list` 轮询代替它。
+
 ### 任务状态
 
 `queued` / `probing` / `downloading` / `paused` / `completed` / `failed` / `canceled`
@@ -412,7 +477,82 @@ multithread-downloader-tasks.json
 
 - 单个任务：`{ ok, action, task }`
 - 批量：`{ ok, action, tasks }`
-- `list` 会附加 `visibleInUi`
+- `list` 会附加 `visibleInUi`、`total`、`waitedSeconds`
+- 任务对象带 `remainingBytes`（剩余字节）与 `etaSeconds`（预估剩余秒数，仅在正在下载且速度有效时出现）
+
+---
+
+## 配套工具：doh_lookup 与 http_probe
+
+这两个工具与 `downloader` 并列注册，共用插件内的网络模块，但**不创建下载任务、不占连接配额**，任何会话都能直接调用。
+
+### doh_lookup
+
+用 DNS over HTTPS 解析域名，不依赖本机 DNS。本机 DNS 被污染时，先拿到真实 IP，再用 `curl --resolve`、Host 头或 `http_probe` 的 `doh` 选项直连。
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `name` | string | 单个域名；传 IP 时原样返回 |
+| `names` | string[] | 批量域名，最多 20 个 |
+| `type` | string | 默认 `A`；`both` = A + AAAA；也支持 CNAME / TXT / MX / NS / SOA / PTR / SRV / CAA / HTTPS |
+| `provider` | string | `cloudflare` / `alidns` / `tencent`，默认用插件设置 |
+| `fresh` | bool | 跳过 60 秒缓存 |
+
+```json
+{ "name": "github.com", "type": "both" }
+```
+
+返回 `{ ok, provider, results, addresses }`：
+
+- `results[]`：每个查询的 `name` / `type` / `status` / `cached` / `ms` / `records[{ type, ttl, data }]`
+- `addresses[]`：A/AAAA 记录整理成的 `{ name, address, family }`
+
+### http_probe
+
+只发 HEAD，必要时补一个 `bytes=0-0` 的 Range 请求，**不下载正文**。下载前确认能否分片、断点续传是否可信，或诊断 403/防盗链。
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `url` | string | 要探测的 http/https 地址 |
+| `headers` | object | Cookie / Referer / Authorization 等；Range 等下载器控制的头会被忽略 |
+| `doh` | bool | 用 DoH 解析该地址 |
+| `dohProvider` | string | `doh=true` 时的提供商 |
+
+```json
+{ "url": "https://example.com/big.iso", "headers": { "Referer": "https://example.com/" } }
+```
+
+返回 `{ ok, url, size, ranges, filename, etag, lastModified }`；401/403 时 `error` 会说明需要哪些请求头。
+
+---
+
+## 作为模块复用
+
+`lib/` 下的模块不依赖 DSH 上下文，可以被其它插件或脚本直接导入：
+
+```js
+// 包内子路径
+import { createDohResolver } from 'dsh-multithread-downloader/doh'
+import { probe } from 'dsh-multithread-downloader/net'
+import { SiteGovernor } from 'dsh-multithread-downloader/limits'
+import { fileChecksum } from 'dsh-multithread-downloader/checksum'
+
+// 或者统一入口（按命名空间）
+import { doh, net, limits, files, checksum } from 'dsh-multithread-downloader/lib'
+
+const { addresses } = await doh.createDohResolver({ provider: 'alidns' }).resolve('example.com')
+const meta = await net.probe('https://example.com/file.zip', AbortSignal.timeout(30_000))
+```
+
+| 模块 | 内容 |
+|---|---|
+| `lib/doh.js` | `createDohResolver`（A/AAAA/CNAME/TXT…，TTL 缓存）、`createDohDispatcher`（undici dispatcher，失败回退系统 DNS）、`resolveAddresses` |
+| `lib/net.js` | `parseHttpUrl`、`sanitizeHeaders`、`fetchWithRedirects`、`probe`、`fingerprintChange`、`ifRangeValue`、`retryDelay`、`resolveGithubAsset` |
+| `lib/limits.js` | `ConnectionSlots`、`RateLimiter`、`LoadGovernor`、`ResourceSampler`、`SiteGovernor`、`siteKeyForUrl` |
+| `lib/files.js` | `defaultDownloadDirectory`、`browseDirectory`、`sanitizeFilename`、`uniqueName`、`freeDiskBytes`、`autoThreadsForBytes` |
+| `lib/checksum.js` | `fileChecksum`（md5/sha1/sha256/sha512/crc32）、`normalizeChecksum` |
+
+自定义 DoH 端点（例如自建解析服务）可传 `createDohResolver({ provider, endpoint })`。
 
 ---
 
@@ -431,6 +571,16 @@ multithread-downloader-tasks.json
 | `/summary` | POST | 侧边栏/进度条汇总 |
 | `/browse` | POST | 目录浏览 |
 | `/pick-directory` | POST | 调用系统原生目录选择器 |
+
+`/state` 在并发相关字段上区分三层语义：
+
+- `maxConnections`：用户设定的连接上限；
+- `effectiveConnections`：考虑设备负载后实际生效的预算（`activeConnections` 是当前已占用数）；
+- `resources`：`{ cpuPct, memoryPct, pressure, level, baseConnections, effectiveConnections, sampledAt }`，`level` 为 `normal / elevated / high / critical`，采样关闭时 `enabled=false`；
+- `sites`：当前被限速的站点，元素为 `{ key, level, connections, rateBytes, cooldownUntil, signals, lastStatus }`；
+- `loadAdaptive` / `siteAdaptive`：两个自适应开关的当前值（`POST /settings` 同名字段可改）。
+
+任务快照在站点受限时额外带 `siteThrottle`（`level / connections / rateBytes / cooldownUntil`）与 `siteKey`；因风控重试过时还带 `riskRetries` 与 `riskNote`。
 
 示例：
 
@@ -545,6 +695,13 @@ Windows 支持被重定向到 OneDrive/其他盘。
 
 全局限速是上限，不是保底；实际速度受服务器/网络/连接数限制。
 
+### 中文路径显示成乱码
+
+1.4.0 之前有两个已知来源，都已修复：Windows 默认下载目录是从 `reg.exe` 读的，它按系统 OEM 代码页（中文系统是 GBK）写管道，按 UTF-8 解码就成了乱码；服务器用 GBK 直接写 `Content-Disposition: filename="中文.zip"` 时，文件名会变成乱码。现在两处都会先按 UTF-8 尝试、失败再回退 GBK。若仍看到乱码：
+
+- 升级到包含该修复的版本（Host 需重启，客户端需刷新页面）
+- 确认不是浏览器/终端字体问题：面板里 `dir` 字段和磁盘上的实际目录名要一致
+
 ### 页面仍显示旧界面
 
 刷新浏览器页面；客户端插件更新不一定自动热加载。
@@ -558,16 +715,18 @@ npm test
 npm pack --dry-run
 ```
 
-测试覆盖：
+测试覆盖（57 项，`test/host.test.mjs` 53 项 + `test/plugin.test.mjs` 4 项）：
 
-- 请求头清洗
-- 重试退避
-- 限速器
-- 探测/401 提示
-- 跨域重定向剥离敏感头
-- SHA-256
-- GitHub Release URL 解析
-- DoH 提供商归一化
+- 请求头清洗、非法 header 名拒绝、跨域重定向剥离敏感头、探测/401 提示
+- 分片下载、4 MB 分段轮转、连接预算共享与排队、单任务不超预算
+- 指纹校验：ETag/Last-Modified 变化重下、续传复核、探测失败拒绝续传、If-Range 重开
+- 416 不再空转、正文空闲超时释放连接槽、暂停后立即恢复只有一轮在跑
+- 重启恢复为 paused 并保留 origin / forceDisplay / DoH 等字段
+- 站点风控降档与恢复、站点之间互不影响、设备负载收缩
+- DoH 解析与缓存、`doh_lookup` 参数校验与 IP 短路、`http_probe` 不读正文
+- 中文目录与中文文件名端到端下载、GBK 响应头解码、OEM 输出解码
+- 多算法校验、ETA 计算、clean 释放文件名、队列中任务可暂停
+- `apply()` 注册三个工具 + 七条路由，dispose 后全部撤销；`pick-directory` 探测不再抛未定义错误；工具参数与输出 schema 覆盖实现真实读取/返回的字段
 
 CI：GitHub Actions，Node 22 / 24，Linux / Windows / macOS。
 
@@ -575,10 +734,13 @@ CI：GitHub Actions，Node 22 / 24，Linux / Windows / macOS。
 
 ## 版本与发布
 
-- 当前版本：**1.1.2**
-- npm：`latest = 1.1.2`
-- GitHub Release：`v1.1.2`
+- 当前版本：**1.4.0**
+- npm：`latest = 1.4.0`
+- GitHub Release：`v1.4.0`
 - 历史版本：
+  - 1.3.1：修复审查发现的问题（416 空转、任务恢复、原生目录选择器、暂停后立即恢复的竞态、正文空闲超时）
+  - 1.3.0：多算法校验、`forceDisplay`、`http_probe`
+  - 1.2.x：站点风控自适应与设备负载自适应
   - 1.1.1：修正 Node 最低版本
   - 1.1.0：DoH 与 GitHub 模式
   - 1.0.4：默认限速 100 MB/s

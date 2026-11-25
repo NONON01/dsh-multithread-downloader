@@ -14,4 +14,6 @@
         dohEnabled: false
         dohProvider: alidns
         githubEnabled: false
-        maxConcurrent: 3
+        maxConnections: 16
+        loadAdaptive: true
+        siteAdaptive: true

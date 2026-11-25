@@ -45,7 +45,9 @@ window.__ModuleLoader__.load({
       'stats.active': '进行中',
       'stats.finished': '已完成',
       'stats.speed': '总速度',
+      'stats.eta': '预计剩余',
       'stats.tasks': '任务',
+      'stats.connections': '连接',
       'empty.title': '还没有下载任务',
       'empty.hint': '在上方填入下载地址，选择线程数后开始下载。',
       'status.queued': '排队中',
@@ -62,6 +64,7 @@ window.__ModuleLoader__.load({
       'action.retry': '重试',
       'action.confirmCancel': '确认取消',
       'task.threads': '{count} 线程',
+      'task.eta': '约剩 {eta}',
       'task.unknownSize': '大小未知',
       'chart.title': '大文件速度曲线',
       'chart.window': '近 {seconds} 秒',
@@ -75,8 +78,25 @@ window.__ModuleLoader__.load({
       'settings.minThreadOffHint': '已关闭：所有任务按线程数分片',
       'settings.rate': '全局限速（KB/s，0 = 不限）',
       'settings.rateHint': '所有下载共享此带宽上限',
-      'settings.concurrency': '同时下载任务数',
-      'settings.concurrencyHint': '多余的下载会排队',
+      'settings.concurrency': '并发限制数',
+      'settings.concurrencyHint': '并发上限 = 并发任务数 × 单任务线程数，默认 16（1–64）；Agent 指定的线程数同样受此约束，不可绕过',
+      'settings.loadAdaptive': '设备负载自适应',
+      'settings.loadAdaptiveHint': '每 2 秒采样 CPU 与内存：压力高时立即收缩连接预算，资源充裕后逐步恢复到设定值',
+      'settings.loadAdaptiveOffHint': '已关闭：始终按设定值分配连接，不看设备负载',
+      'settings.siteAdaptive': '站点风控自适应',
+      'settings.siteAdaptiveHint': '同一网站（含子域）返回 403/429/503 时降低该站并发并叠加站点限速，冷却后逐步恢复；不同网站各自独立',
+      'settings.siteAdaptiveOffHint': '已关闭：被拒站点按普通失败重试，不做降档',
+      'stats.load': '负载',
+      'stats.effective': '有效并发',
+      'site.title': '站点限速',
+      'site.connections': '{count} 连接',
+      'site.cooldown': '冷却 {seconds}s',
+      'site.note': 'HTTP {status} 触发风控 · 第 {signals} 次',
+      'task.risk': '站点限速 L{level} · {connections} 连接 · {rate}/s',
+      'load.level.normal': '正常',
+      'load.level.elevated': '偏高',
+      'load.level.high': '高',
+      'load.level.critical': '紧张',
       'settings.agentOnHint': '已开启：阈值设置已屏蔽（仍约束 Agent 任务）；手动下载始终多线程并显示',
       'settings.doh': 'DoH 解析',
       'settings.dohHint': '通过 HTTPS 查询 DNS，绕过被污染的本地 DNS；失败时回退系统 DNS',
@@ -102,6 +122,17 @@ window.__ModuleLoader__.load({
       'settings.fingerprintResumeOffHint': '已关闭：只按文件大小判断，远端换版本可能拼出混合文件',
       'settings.agentAutonomy': 'Agent 自主模式',
       'settings.agentAutonomyHint': '开启后阈值设置屏蔽但继续约束 Agent 任务；面板手动下载不受限制',
+      'settings.title': '设置',
+      'settings.summary': '并发 {connections} · {rate} · 静默 {threshold} · {doh}',
+      'settings.rateValue': '{kb} KB/s',
+      'settings.unlimited': '不限速',
+      'settings.silentOff': '静默关',
+      'settings.dohOn': 'DoH 开',
+      'settings.dohOff': 'DoH 关',
+      'settings.group.connection': '连接与带宽',
+      'settings.group.download': '下载与续传',
+      'settings.group.agent': 'Agent 与阈值',
+      'settings.group.network': '网络与站点',
       'badge.unfinished': '{count} 个未完成任务',
       'dock.open': '打开面板',
       'dock.tasks': '{count} 个下载任务',
@@ -145,7 +176,9 @@ window.__ModuleLoader__.load({
       'stats.active': 'Active',
       'stats.finished': 'Completed',
       'stats.speed': 'Total speed',
+      'stats.eta': 'ETA',
       'stats.tasks': 'Tasks',
+      'stats.connections': 'Connections',
       'empty.title': 'No downloads yet',
       'empty.hint': 'Paste a URL above, choose the thread count, and start.',
       'status.queued': 'Queued',
@@ -162,6 +195,7 @@ window.__ModuleLoader__.load({
       'action.retry': 'Retry',
       'action.confirmCancel': 'Confirm cancel',
       'task.threads': '{count} threads',
+      'task.eta': 'ETA {eta}',
       'task.unknownSize': 'Unknown size',
       'chart.title': 'Large-file speed',
       'chart.window': 'Last {seconds}s',
@@ -173,14 +207,27 @@ window.__ModuleLoader__.load({
       'settings.thresholdHint': 'Applies to agent tasks only: below this size they stay out of the panel and conversation strip',
       'settings.thresholdOffHint': 'Off: every task is shown',
       'settings.minThreadOffHint': 'Off: every task splits across threads',
-      'settings.rate': '全局限速（KB/s，0 = 不限）',
-      'settings.rateHint': '所有下载共享此带宽上限',
-      'settings.concurrency': '同时下载任务数',
-      'settings.concurrencyHint': '多余的下载会排队',
       'settings.rate': 'Global rate limit (KB/s, 0 = unlimited)',
       'settings.rateHint': 'Shared by all downloads',
-      'settings.concurrency': 'Concurrent downloads',
-      'settings.concurrencyHint': 'Extra downloads wait in the queue',
+      'settings.concurrency': 'Connection limit',
+      'settings.concurrencyHint': 'Cap = concurrent tasks × threads per task; default 16 (1–64). Threads an agent specifies are bound by the same cap',
+      'settings.loadAdaptive': 'Device load adaptation',
+      'settings.loadAdaptiveHint': 'Samples CPU and memory every 2s: shrinks the connection budget at once under pressure and recovers it gradually',
+      'settings.loadAdaptiveOffHint': 'Off: the configured limit is always used, regardless of device load',
+      'settings.siteAdaptive': 'Site risk-control adaptation',
+      'settings.siteAdaptiveHint': 'On 403/429/503 from one site (subdomains included) it lowers that site\'s connections and adds a site-wide rate limit, then recovers gradually; other sites are unaffected',
+      'settings.siteAdaptiveOffHint': 'Off: rejected sites are retried like ordinary failures, with no throttle step-down',
+      'stats.load': 'Load',
+      'stats.effective': 'Effective conns',
+      'site.title': 'Throttled sites',
+      'site.connections': '{count} conns',
+      'site.cooldown': 'cooling {seconds}s',
+      'site.note': 'risk control on HTTP {status} · signal {signals}',
+      'task.risk': 'Site throttled L{level} · {connections} conns · {rate}/s',
+      'load.level.normal': 'normal',
+      'load.level.elevated': 'elevated',
+      'load.level.high': 'high',
+      'load.level.critical': 'critical',
       'settings.agentOnHint': 'On: thresholds are masked but still govern agent tasks; manual downloads stay multi-threaded and visible',
       'settings.doh': 'DoH resolution',
       'settings.dohHint': 'Resolve DNS over HTTPS to bypass local poisoning; falls back to system DNS on failure',
@@ -206,6 +253,17 @@ window.__ModuleLoader__.load({
       'settings.fingerprintResumeOffHint': 'Off: only the file size is compared, so a changed remote file can mix versions',
       'settings.agentAutonomy': 'Agent autonomy',
       'settings.agentAutonomyHint': 'Threshold settings are masked but still govern agent tasks; manual panel downloads are unrestricted',
+      'settings.title': 'Settings',
+      'settings.summary': '{connections} connections · {rate} · silent {threshold} · {doh}',
+      'settings.rateValue': '{kb} KB/s',
+      'settings.unlimited': 'unlimited',
+      'settings.silentOff': 'silent off',
+      'settings.dohOn': 'DoH on',
+      'settings.dohOff': 'DoH off',
+      'settings.group.connection': 'Connections & bandwidth',
+      'settings.group.download': 'Download & resume',
+      'settings.group.agent': 'Agent & thresholds',
+      'settings.group.network': 'Network & sites',
       'badge.unfinished': '{count} unfinished downloads',
       'dock.open': 'Open panel',
       'dock.tasks': '{count} downloads',
@@ -248,12 +306,24 @@ window.__ModuleLoader__.load({
 .mtd-btn:disabled { opacity: .5; cursor: default; }
 .mtd-primary { background: var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary)); color: var(--dsw-alias-label-primary-foreground, #fff); border-color: transparent; padding: 6px 18px; }
 .mtd-danger:hover:enabled { color: var(--dsw-alias-state-error-primary); border-color: var(--dsw-alias-state-error-primary); }
-.mtd-settings { display: flex; flex-direction: column; gap: 6px; margin: -2px 2px 14px; color: var(--dsw-alias-label-secondary); font-size: 12px; }
-.mtd-setting-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.mtd-settings { padding: 0; margin: 0 0 14px; color: var(--dsw-alias-label-secondary); font-size: 12px; overflow: hidden; }
+.mtd-settings-head { display: flex; align-items: center; gap: 8px; padding: 11px 16px; cursor: pointer; list-style: none; }
+.mtd-settings-head::-webkit-details-marker { display: none; }
+.mtd-settings[open] > .mtd-settings-head { border-bottom: 1px solid var(--dsw-alias-border-l1); }
+.mtd-settings-head:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: -2px; }
+.mtd-settings-chevron { display: inline-flex; flex: none; color: var(--dsw-alias-label-secondary); transition: transform .15s ease; }
+.mtd-settings[open] .mtd-settings-chevron { transform: rotate(90deg); }
+.mtd-settings-title { flex: none; font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
+.mtd-settings-summary { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-variant-numeric: tabular-nums; }
+.mtd-settings-body { display: flex; flex-direction: column; gap: 16px; padding: 14px 16px 16px; }
+.mtd-setting-group { display: flex; flex-direction: column; gap: 7px; }
+.mtd-setting-group + .mtd-setting-group { border-top: 1px solid var(--dsw-alias-border-l1); padding-top: 14px; }
+.mtd-setting-group-title { margin: 0 0 2px; font-size: 11.5px; font-weight: 600; letter-spacing: .02em; color: var(--dsw-alias-label-secondary); }
+.mtd-setting-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.mtd-setting-hint { flex: 1 1 100%; min-width: 0; opacity: .8; font-size: 11px; }
 .mtd-unit { flex: none; padding: 4px 6px; }
 .mtd-threshold { width: 76px; flex: none; padding: 4px 8px; }
 .mtd-setting-unit { flex: none; }
-.mtd-setting-hint { flex: 1 1 160px; min-width: 0; opacity: .8; font-size: 11px; }
 .mtd-stats { display: flex; flex-wrap: wrap; gap: 8px 22px; color: var(--dsw-alias-label-secondary); font-size: 12px; margin: 14px 2px 12px; }
 .mtd-stats b { color: var(--dsw-alias-label-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
 .mtd-banner { margin-bottom: 12px; border: 1px solid var(--dsw-alias-state-error-primary); color: var(--dsw-alias-state-error-primary); background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 8%, transparent); border-radius: 8px; padding: 8px 12px; font-size: 12px; overflow-wrap: anywhere; }
@@ -277,6 +347,11 @@ window.__ModuleLoader__.load({
 .mtd-actions { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
 .mtd-task-error { margin-top: 8px; color: var(--dsw-alias-state-error-primary); font-size: 11.5px; overflow-wrap: anywhere; }
 .mtd-task-note { margin-top: 8px; opacity: .75; font-size: 11.5px; overflow-wrap: anywhere; }
+.mtd-sites { margin: 0 0 12px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.mtd-sites-title { font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.mtd-site-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.mtd-site-key { font-weight: 600; overflow-wrap: anywhere; }
+.mtd-site-note { opacity: .7; font-size: 11.5px; }
 .mtd-modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; padding: 24px; background: color-mix(in srgb, #000 35%, transparent); }
 .mtd-modal-card { display: flex; flex-direction: column; width: min(560px, 100%); max-height: min(70vh, 600px); overflow: hidden; background: var(--dsw-alias-bg-overlay); border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px; box-shadow: 0 18px 50px rgba(0, 0, 0, .25); }
 .mtd-modal-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
@@ -285,9 +360,9 @@ window.__ModuleLoader__.load({
 .mtd-crumb { flex: none; max-width: 160px; padding: 2px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 0; border-radius: 4px; background: none; color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; cursor: pointer; }
 .mtd-crumb:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
 .mtd-modal-body { flex: 1 1 auto; min-height: 180px; max-height: 360px; padding: 6px; overflow-y: auto; }
-.mtd-dir { display: block; width: 100%; padding: 7px 10px; border: 0; border-radius: 6px; background: none; color: var(--dsw-alias-label-primary); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
-.mtd-dir:hover { background: var(--dsw-alias-interactive-bg-hover); }
-.mtd-dir.hidden { opacity: .6; }
+.mtd-dirbtn { display: block; width: 100%; padding: 7px 10px; border: 0; border-radius: 6px; background: none; color: var(--dsw-alias-label-primary); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+.mtd-dirbtn:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.mtd-dirbtn.hidden { opacity: .6; }
 .mtd-modal-note { padding: 16px; color: var(--dsw-alias-label-secondary); font-size: 12px; text-align: center; }
 .mtd-modal-error { padding: 12px; color: var(--dsw-alias-state-error-primary); font-size: 12px; }
 .mtd-modal-foot { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--dsw-alias-border-l1); }
@@ -646,6 +721,9 @@ button:has(> span > .mtd-icon) { position: relative; }
           { className: 'mtd-meta' },
           h('span', null, total),
           task.status === 'downloading' ? h('span', null, formatSpeed(task.speed)) : null,
+          task.status === 'downloading' && task.etaSeconds !== undefined
+            ? h('span', null, fill(t('task.eta'), { eta: formatEta(task.etaSeconds) }))
+            : null,
           h('span', null, fill(t('task.threads'), { count: task.threads })),
           h(
             'span',
@@ -682,6 +760,19 @@ button:has(> span > .mtd-icon) { position: relative; }
         task.fingerprint !== undefined && typeof task.fingerprint.note === 'string' && task.fingerprint.note !== ''
           ? h('div', { className: 'mtd-task-note' }, task.fingerprint.note)
           : null,
+        typeof task.riskNote === 'string' && task.riskNote !== ''
+          ? h('div', { className: 'mtd-task-note' }, task.riskNote)
+          : task.siteThrottle !== undefined
+            ? h(
+                'div',
+                { className: 'mtd-task-note' },
+                fill(t('task.risk'), {
+                  level: task.siteThrottle.level,
+                  connections: task.siteThrottle.connections,
+                  rate: formatSpeed(task.siteThrottle.rateBytes),
+                }),
+              )
+            : null,
       )
     }
 
@@ -701,6 +792,9 @@ button:has(> span > .mtd-icon) { position: relative; }
     }
 
     const THRESHOLD_UNIT_BYTES = { KB: 1024, MB: 1024 * 1024, GB: 1024 * 1024 * 1024 }
+
+    /** 并发限制数（连接数 = 任务数 × 线程数）的候选值，默认 16。 */
+    const CONCURRENCY_OPTIONS = ['1', '2', '4', '6', '8', '12', '16', '24', '32', '48', '64']
 
     function pickThresholdUnit(bytes) {
       if (bytes >= THRESHOLD_UNIT_BYTES.GB) return 'GB'
@@ -759,7 +853,7 @@ button:has(> span > .mtd-icon) { position: relative; }
                         {
                           key: entry.path,
                           type: 'button',
-                          className: `mtd-dir${entry.hidden ? ' hidden' : ''}`,
+                          className: `mtd-dirbtn${entry.hidden ? ' hidden' : ''}`,
                           title: entry.path,
                           onClick: () => onNavigate(entry.path),
                         },
@@ -822,6 +916,8 @@ button:has(> span > .mtd-icon) { position: relative; }
       const [url, setUrl] = React.useState('')
       const [directory, setDirectory] = React.useState('')
       const [threads, setThreads] = React.useState(String(defaults.threads || 4))
+      // 用户手动改过线程数后，就不再被 Host 的默认值覆盖。
+      const [threadsTouched, setThreadsTouched] = React.useState(false)
       const [busy, setBusy] = React.useState(false)
       const [pickerOpen, setPickerOpen] = React.useState(false)
       const [picking, setPicking] = React.useState(false)
@@ -839,7 +935,9 @@ button:has(> span > .mtd-icon) { position: relative; }
       const [dohConfirm, setDohConfirm] = React.useState(false)
       const [githubEnabled, setGithubEnabled] = React.useState(false)
       const [rate, setRate] = React.useState('0')
-      const [concurrency, setConcurrency] = React.useState('3')
+      const [concurrency, setConcurrency] = React.useState('16')
+      const [loadAdaptive, setLoadAdaptive] = React.useState(true)
+      const [siteAdaptive, setSiteAdaptive] = React.useState(true)
       const [headersText, setHeadersText] = React.useState('')
       const [checksumAlgorithm, setChecksumAlgorithm] = React.useState('sha256')
       const [checksum, setChecksum] = React.useState('')
@@ -847,6 +945,17 @@ button:has(> span > .mtd-icon) { position: relative; }
       const downloads = useDownloads((message) => setError(fill(t('error.request'), { message })))
 
       const meta = downloads.meta
+      // 线程默认值以 Host 配置为准（cordis.patch.yml 里可以不是 4）。
+      const defaultThreads = meta !== null && Number(meta.defaultThreads) > 0
+        ? Math.round(Number(meta.defaultThreads))
+        : (Number(defaults.threads) || 4)
+      const threadOptions = [...new Set([1, 2, 3, 4, 6, 8, 12, 16, defaultThreads])]
+        .sort((left, right) => left - right)
+        .map(String)
+      React.useEffect(() => {
+        if (threadsTouched) return
+        setThreads(String(defaultThreads))
+      }, [defaultThreads, threadsTouched])
       const largeFileBytes = meta === null
         ? undefined
         : meta.largeFileBytes !== undefined
@@ -899,15 +1008,37 @@ button:has(> span > .mtd-icon) { position: relative; }
         if (meta !== null && meta.githubEnabled !== undefined) setGithubEnabled(Boolean(meta.githubEnabled))
       }, [meta === null ? undefined : meta.githubEnabled])
       React.useEffect(() => {
+        if (meta !== null && meta.loadAdaptive !== undefined) setLoadAdaptive(Boolean(meta.loadAdaptive))
+      }, [meta === null ? undefined : meta.loadAdaptive])
+      React.useEffect(() => {
+        if (meta !== null && meta.siteAdaptive !== undefined) setSiteAdaptive(Boolean(meta.siteAdaptive))
+      }, [meta === null ? undefined : meta.siteAdaptive])
+      React.useEffect(() => {
         if (meta !== null && meta.rateLimitBytes !== undefined) setRate(String(Math.round(meta.rateLimitBytes / 1024)))
       }, [meta === null ? undefined : meta.rateLimitBytes])
       React.useEffect(() => {
-        if (meta !== null && meta.maxConcurrent !== undefined) setConcurrency(String(meta.maxConcurrent))
-      }, [meta === null ? undefined : meta.maxConcurrent])
+        if (meta === null) return
+        const limit = meta.maxConnections !== undefined ? meta.maxConnections : meta.maxConcurrent
+        if (limit !== undefined) setConcurrency(String(limit))
+      }, [meta === null ? undefined : meta.maxConnections, meta === null ? undefined : meta.maxConcurrent])
       const tasks = downloads.tasks
+      const resources = meta !== null && meta.resources !== undefined ? meta.resources : null
+      const sites = meta !== null && Array.isArray(meta.sites) ? meta.sites : []
+      const effectiveConnections = meta !== null && meta.effectiveConnections !== undefined
+        ? meta.effectiveConnections
+        : meta !== null && meta.maxConnections !== undefined
+          ? meta.maxConnections
+          : Number(concurrency) || 0
       const active = tasks.filter((task) => task.status === 'downloading' || task.status === 'probing' || task.status === 'queued').length
       const finished = tasks.filter((task) => task.status === 'completed').length
       const speed = tasks.reduce((sum, task) => sum + (task.status === 'downloading' ? task.speed : 0), 0)
+      // 面板整体 ETA：只统计正在下载的任务，大小未知的任务不计入。
+      const remainingBytes = tasks.reduce((sum, task) => (
+        task.status === 'downloading' && task.totalBytes > 0
+          ? sum + Math.max(0, task.totalBytes - task.receivedBytes)
+          : sum
+      ), 0)
+      const etaSeconds = speed > 0 && remainingBytes > 0 ? Math.max(1, Math.round(remainingBytes / speed)) : 0
       const thresholdBytes = largeFileBytes !== undefined ? largeFileBytes : 16 * 1024 * 1024
 
       const browse = async () => {
@@ -988,7 +1119,7 @@ button:has(> span > .mtd-icon) { position: relative; }
 
       const saveConcurrency = async (value) => {
         setConcurrency(value)
-        await saveFlags({ maxConcurrent: Number(value) })
+        await saveFlags({ maxConnections: Number(value) })
       }
 
       const requestDohToggle = (next) => {
@@ -1093,6 +1224,21 @@ button:has(> span > .mtd-icon) { position: relative; }
       const defaultDirectory = meta?.directory || defaults.directory || ''
       const settingsLocked = agentAutonomy
 
+      /** 设置分组：一个标题 + 若干设置行，收起时只显示标题与摘要。 */
+      const settingGroup = (title, ...rows) => h(
+        'section',
+        { className: 'mtd-setting-group' },
+        h('h3', { className: 'mtd-setting-group-title' }, title),
+        ...rows,
+      )
+      const rateKb = Math.round(Number(rate))
+      const settingsSummary = fill(t('settings.summary'), {
+        connections: String(effectiveConnections),
+        rate: Number.isFinite(rateKb) && rateKb > 0 ? fill(t('settings.rateValue'), { kb: String(rateKb) }) : t('settings.unlimited'),
+        threshold: silentEnabled ? `${threshold === '' ? '–' : threshold} ${thresholdUnit}` : t('settings.silentOff'),
+        doh: dohEnabled ? t('settings.dohOn') : t('settings.dohOff'),
+      })
+
       return h(
         'div',
         { className: 'mtd-page' },
@@ -1150,9 +1296,12 @@ button:has(> span > .mtd-icon) { position: relative; }
                   className: 'mtd-input mtd-select',
                   value: threads,
                   'aria-label': t('form.threads'),
-                  onChange: (event) => setThreads(event.target.value),
+                  onChange: (event) => {
+                    setThreadsTouched(true)
+                    setThreads(event.target.value)
+                  },
                 },
-                ['1', '2', '4', '8', '16'].map((value) =>
+                threadOptions.map((value) =>
                   h('option', { key: value, value }, `${value} ${t('form.threads')}`),
                 ),
               ),
@@ -1211,243 +1360,316 @@ button:has(> span > .mtd-icon) { position: relative; }
               }),
             ),
             h(
-              'div',
-              { className: 'mtd-settings' },
+              'details',
+              { className: 'mtd-card mtd-settings' },
               h(
-                'div',
-                { className: 'mtd-setting-row' },
+                'summary',
+                { className: 'mtd-settings-head' },
                 h(
-                  'label',
-                  { className: 'mtd-switch-row' },
-                  h(Toggle, {
-                    checked: silentEnabled,
-                    disabled: settingsLocked,
-                    label: t('settings.threshold'),
-                    onChange: (next) => {
-                      setSilentEnabled(next)
-                      void saveFlags({ silentEnabled: next })
-                    },
-                  }),
-                  h('span', null, t('settings.threshold')),
+                  'span',
+                  { className: 'mtd-settings-chevron', 'aria-hidden': true },
+                  h(
+                    'svg',
+                    { width: 10, height: 10, viewBox: '0 0 12 12', fill: 'none', focusable: 'false' },
+                    h('path', {
+                      d: 'M4 2 L8 6 L4 10',
+                      stroke: 'currentColor',
+                      strokeWidth: 1.8,
+                      strokeLinecap: 'round',
+                      strokeLinejoin: 'round',
+                    }),
+                  ),
                 ),
-                h('input', {
-                  id: 'mtd-threshold',
-                  className: 'mtd-input mtd-threshold',
-                  type: 'text',
-                  inputMode: 'decimal',
-                  disabled: settingsLocked || !silentEnabled,
-                  value: threshold,
-                  'aria-label': t('settings.threshold'),
-                  onChange: (event) => setThreshold(event.target.value),
-                  onBlur: saveThreshold,
-                  onKeyDown: (event) => {
-                    if (event.key !== 'Enter') return
-                    event.preventDefault()
-                    void saveThreshold()
-                    event.currentTarget.blur()
-                  },
-                }),
-                h(
-                  'select',
-                  {
-                    className: 'mtd-input mtd-unit',
-                    disabled: settingsLocked || !silentEnabled,
-                    value: thresholdUnit,
-                    'aria-label': t('settings.unit'),
-                    onChange: (event) => switchThresholdUnit(event.target.value),
-                  },
-                  h('option', { value: 'KB' }, 'KB'),
-                  h('option', { value: 'MB' }, 'MB'),
-                  h('option', { value: 'GB' }, 'GB'),
-                ),
-                h('span', { className: 'mtd-setting-hint' }, silentEnabled ? t('settings.thresholdHint') : t('settings.thresholdOffHint')),
+                h('span', { className: 'mtd-settings-title' }, t('settings.title')),
+                h('span', { className: 'mtd-settings-summary' }, settingsSummary),
               ),
               h(
                 'div',
-                { className: 'mtd-setting-row' },
-                h(
-                  'label',
-                  { className: 'mtd-switch-row' },
-                  h(Toggle, {
-                    checked: minThreadEnabled,
-                    disabled: settingsLocked,
-                    label: t('settings.minThread'),
-                    onChange: (next) => {
-                      setMinThreadEnabled(next)
-                      void saveFlags({ minThreadEnabled: next })
-                    },
-                  }),
-                  h('span', null, t('settings.minThread')),
+                { className: 'mtd-settings-body' },
+                settingGroup(
+                  t('settings.group.connection'),
+                  h(
+                    'div',
+                    { className: 'mtd-setting-row' },
+                    h('span', { className: 'mtd-setting-label' }, t('settings.concurrency')),
+                    h(
+                      'select',
+                      {
+                        className: 'mtd-input mtd-select',
+                        value: concurrency,
+                        'aria-label': t('settings.concurrency'),
+                        onChange: (event) => void saveConcurrency(event.target.value),
+                      },
+                      [...new Set(CONCURRENCY_OPTIONS.concat(concurrency))].sort((left, right) => Number(left) - Number(right)).map((value) => h('option', { key: value, value }, value)),
+                    ),
+                    h('span', { className: 'mtd-setting-hint' }, t('settings.concurrencyHint')),
+                  ),
+                  h(
+                    'div',
+                    { className: 'mtd-setting-row' },
+                    h('span', { className: 'mtd-setting-label' }, t('settings.rate')),
+                    h('input', {
+                      id: 'mtd-rate',
+                      className: 'mtd-input mtd-threshold',
+                      type: 'text',
+                      inputMode: 'numeric',
+                      value: rate,
+                      'aria-label': t('settings.rate'),
+                      onChange: (event) => setRate(event.target.value),
+                      onBlur: saveRate,
+                      onKeyDown: (event) => {
+                        if (event.key !== 'Enter') return
+                        event.preventDefault()
+                        void saveRate()
+                        event.currentTarget.blur()
+                      },
+                    }),
+                    h('span', { className: 'mtd-setting-hint' }, t('settings.rateHint')),
+                  ),
+                  h(
+                    'div',
+                    { className: 'mtd-setting-row' },
+                    h(
+                      'label',
+                      { className: 'mtd-switch-row' },
+                      h(Toggle, {
+                        checked: loadAdaptive,
+                        label: t('settings.loadAdaptive'),
+                        onChange: (next) => {
+                          setLoadAdaptive(next)
+                          void saveFlags({ loadAdaptive: next })
+                        },
+                      }),
+                      h('span', null, t('settings.loadAdaptive')),
+                    ),
+                    h('span', { className: 'mtd-setting-hint' }, loadAdaptive ? t('settings.loadAdaptiveHint') : t('settings.loadAdaptiveOffHint')),
+                  ),
                 ),
-                h('input', {
-                  id: 'mtd-minthread',
-                  className: 'mtd-input mtd-threshold',
-                  type: 'text',
-                  inputMode: 'numeric',
-                  disabled: settingsLocked || !minThreadEnabled,
-                  value: minThread,
-                  'aria-label': t('settings.minThread'),
-                  onChange: (event) => setMinThread(event.target.value),
-                  onBlur: saveMinThread,
-                  onKeyDown: (event) => {
-                    if (event.key !== 'Enter') return
-                    event.preventDefault()
-                    void saveMinThread()
-                    event.currentTarget.blur()
-                  },
-                }),
-                h(
-                  'select',
-                  {
-                    className: 'mtd-input mtd-unit',
-                    disabled: settingsLocked || !minThreadEnabled,
-                    value: minThreadUnit,
-                    'aria-label': t('settings.unit'),
-                    onChange: (event) => switchMinThreadUnit(event.target.value),
-                  },
-                  h('option', { value: 'KB' }, 'KB'),
-                  h('option', { value: 'MB' }, 'MB'),
+                settingGroup(
+                  t('settings.group.download'),
+                  h(
+                    'div',
+                    { className: 'mtd-setting-row' },
+                    h(
+                      'label',
+                      { className: 'mtd-switch-row' },
+                      h(Toggle, {
+                        checked: autoThreads,
+                        label: t('settings.autoThreads'),
+                        onChange: (next) => {
+                          setAutoThreads(next)
+                          void saveFlags({ autoThreads: next })
+                        },
+                      }),
+                      h('span', null, t('settings.autoThreads')),
+                    ),
+                    h('span', { className: 'mtd-setting-hint' }, autoThreads ? t('settings.autoThreadsHint') : t('settings.autoThreadsOffHint')),
+                  ),
+                  h(
+                    'div',
+                    { className: 'mtd-setting-row' },
+                    h(
+                      'label',
+                      { className: 'mtd-switch-row' },
+                      h(Toggle, {
+                        checked: fingerprintResume,
+                        label: t('settings.fingerprintResume'),
+                        onChange: (next) => {
+                          setFingerprintResume(next)
+                          void saveFlags({ fingerprintResume: next })
+                        },
+                      }),
+                      h('span', null, t('settings.fingerprintResume')),
+                    ),
+                    h('span', { className: 'mtd-setting-hint' }, fingerprintResume ? t('settings.fingerprintResumeHint') : t('settings.fingerprintResumeOffHint')),
+                  ),
                 ),
-                h('span', { className: 'mtd-setting-hint' }, minThreadEnabled ? t('settings.minThreadHint') : t('settings.minThreadOffHint')),
-              ),
-              h(
-                'div',
-                { className: 'mtd-setting-row' },
-                h(
-                  'label',
-                  { className: 'mtd-switch-row' },
-                  h(Toggle, {
-                    checked: autoThreads,
-                    label: t('settings.autoThreads'),
-                    onChange: (next) => {
-                      setAutoThreads(next)
-                      void saveFlags({ autoThreads: next })
-                    },
-                  }),
-                  h('span', null, t('settings.autoThreads')),
+                settingGroup(
+                  t('settings.group.agent'),
+                  h(
+                    'div',
+                    { className: 'mtd-setting-row' },
+                    h(
+                      'label',
+                      { className: 'mtd-switch-row' },
+                      h(Toggle, {
+                        checked: agentAutonomy,
+                        disabled: false,
+                        label: t('settings.agentAutonomy'),
+                        onChange: (next) => {
+                          setAgentAutonomy(next)
+                          void saveFlags({ agentAutonomy: next })
+                        },
+                      }),
+                      h('span', null, t('settings.agentAutonomy')),
+                    ),
+                    h('span', { className: 'mtd-setting-hint' }, agentAutonomy ? t('settings.agentOnHint') : t('settings.agentOffHint')),
+                  ),
+                  h(
+                    'div',
+                    { className: 'mtd-setting-row' },
+                    h(
+                      'label',
+                      { className: 'mtd-switch-row' },
+                      h(Toggle, {
+                        checked: silentEnabled,
+                        disabled: settingsLocked,
+                        label: t('settings.threshold'),
+                        onChange: (next) => {
+                          setSilentEnabled(next)
+                          void saveFlags({ silentEnabled: next })
+                        },
+                      }),
+                      h('span', null, t('settings.threshold')),
+                    ),
+                    h('input', {
+                      id: 'mtd-threshold',
+                      className: 'mtd-input mtd-threshold',
+                      type: 'text',
+                      inputMode: 'decimal',
+                      disabled: settingsLocked || !silentEnabled,
+                      value: threshold,
+                      'aria-label': t('settings.threshold'),
+                      onChange: (event) => setThreshold(event.target.value),
+                      onBlur: saveThreshold,
+                      onKeyDown: (event) => {
+                        if (event.key !== 'Enter') return
+                        event.preventDefault()
+                        void saveThreshold()
+                        event.currentTarget.blur()
+                      },
+                    }),
+                    h(
+                      'select',
+                      {
+                        className: 'mtd-input mtd-unit',
+                        disabled: settingsLocked || !silentEnabled,
+                        value: thresholdUnit,
+                        'aria-label': t('settings.unit'),
+                        onChange: (event) => switchThresholdUnit(event.target.value),
+                      },
+                      h('option', { value: 'KB' }, 'KB'),
+                      h('option', { value: 'MB' }, 'MB'),
+                      h('option', { value: 'GB' }, 'GB'),
+                    ),
+                    h('span', { className: 'mtd-setting-hint' }, silentEnabled ? t('settings.thresholdHint') : t('settings.thresholdOffHint')),
+                  ),
+                  h(
+                    'div',
+                    { className: 'mtd-setting-row' },
+                    h(
+                      'label',
+                      { className: 'mtd-switch-row' },
+                      h(Toggle, {
+                        checked: minThreadEnabled,
+                        disabled: settingsLocked,
+                        label: t('settings.minThread'),
+                        onChange: (next) => {
+                          setMinThreadEnabled(next)
+                          void saveFlags({ minThreadEnabled: next })
+                        },
+                      }),
+                      h('span', null, t('settings.minThread')),
+                    ),
+                    h('input', {
+                      id: 'mtd-minthread',
+                      className: 'mtd-input mtd-threshold',
+                      type: 'text',
+                      inputMode: 'numeric',
+                      disabled: settingsLocked || !minThreadEnabled,
+                      value: minThread,
+                      'aria-label': t('settings.minThread'),
+                      onChange: (event) => setMinThread(event.target.value),
+                      onBlur: saveMinThread,
+                      onKeyDown: (event) => {
+                        if (event.key !== 'Enter') return
+                        event.preventDefault()
+                        void saveMinThread()
+                        event.currentTarget.blur()
+                      },
+                    }),
+                    h(
+                      'select',
+                      {
+                        className: 'mtd-input mtd-unit',
+                        disabled: settingsLocked || !minThreadEnabled,
+                        value: minThreadUnit,
+                        'aria-label': t('settings.unit'),
+                        onChange: (event) => switchMinThreadUnit(event.target.value),
+                      },
+                      h('option', { value: 'KB' }, 'KB'),
+                      h('option', { value: 'MB' }, 'MB'),
+                    ),
+                    h('span', { className: 'mtd-setting-hint' }, minThreadEnabled ? t('settings.minThreadHint') : t('settings.minThreadOffHint')),
+                  ),
                 ),
-                h('span', { className: 'mtd-setting-hint' }, autoThreads ? t('settings.autoThreadsHint') : t('settings.autoThreadsOffHint')),
-              ),
-              h(
-                'div',
-                { className: 'mtd-setting-row' },
-                h(
-                  'label',
-                  { className: 'mtd-switch-row' },
-                  h(Toggle, {
-                    checked: fingerprintResume,
-                    label: t('settings.fingerprintResume'),
-                    onChange: (next) => {
-                      setFingerprintResume(next)
-                      void saveFlags({ fingerprintResume: next })
-                    },
-                  }),
-                  h('span', null, t('settings.fingerprintResume')),
+                settingGroup(
+                  t('settings.group.network'),
+                  h(
+                    'div',
+                    { className: 'mtd-setting-row' },
+                    h(
+                      'label',
+                      { className: 'mtd-switch-row' },
+                      h(Toggle, {
+                        checked: siteAdaptive,
+                        label: t('settings.siteAdaptive'),
+                        onChange: (next) => {
+                          setSiteAdaptive(next)
+                          void saveFlags({ siteAdaptive: next })
+                        },
+                      }),
+                      h('span', null, t('settings.siteAdaptive')),
+                    ),
+                    h('span', { className: 'mtd-setting-hint' }, siteAdaptive ? t('settings.siteAdaptiveHint') : t('settings.siteAdaptiveOffHint')),
+                  ),
+                  h(
+                    'div',
+                    { className: 'mtd-setting-row' },
+                    h(
+                      'label',
+                      { className: 'mtd-switch-row' },
+                      h(Toggle, {
+                        checked: dohEnabled,
+                        label: t('settings.doh'),
+                        onChange: requestDohToggle,
+                      }),
+                      h('span', null, t('settings.doh')),
+                    ),
+                    h(
+                      'select',
+                      {
+                        className: 'mtd-input mtd-select',
+                        value: dohProvider,
+                        disabled: !dohEnabled,
+                        'aria-label': t('settings.dohProvider'),
+                        onChange: (event) => changeDohProvider(event.target.value),
+                      },
+                      h('option', { value: 'cloudflare' }, 'Cloudflare'),
+                      h('option', { value: 'alidns' }, 'AliDNS'),
+                      h('option', { value: 'tencent' }, 'Tencent'),
+                    ),
+                    h('span', { className: 'mtd-setting-hint' }, t('settings.dohHint')),
+                  ),
+                  h(
+                    'div',
+                    { className: 'mtd-setting-row' },
+                    h(
+                      'label',
+                      { className: 'mtd-switch-row' },
+                      h(Toggle, {
+                        checked: githubEnabled,
+                        label: t('settings.github'),
+                        onChange: (next) => {
+                          setGithubEnabled(next)
+                          void saveFlags({ githubEnabled: next })
+                        },
+                      }),
+                      h('span', null, t('settings.github')),
+                    ),
+                    h('span', { className: 'mtd-setting-hint' }, t('settings.githubHint')),
+                  ),
                 ),
-                h('span', { className: 'mtd-setting-hint' }, fingerprintResume ? t('settings.fingerprintResumeHint') : t('settings.fingerprintResumeOffHint')),
-              ),
-              h(
-                'div',
-                { className: 'mtd-setting-row' },
-                h(
-                  'label',
-                  { className: 'mtd-switch-row' },
-                  h(Toggle, {
-                    checked: agentAutonomy,
-                    disabled: false,
-                    label: t('settings.agentAutonomy'),
-                    onChange: (next) => {
-                      setAgentAutonomy(next)
-                      void saveFlags({ agentAutonomy: next })
-                    },
-                  }),
-                  h('span', null, t('settings.agentAutonomy')),
-                ),
-                h('span', { className: 'mtd-setting-hint' }, agentAutonomy ? t('settings.agentOnHint') : t('settings.agentOffHint')),
-              ),
-              h(
-                'div',
-                { className: 'mtd-setting-row' },
-                h(
-                  'label',
-                  { className: 'mtd-switch-row' },
-                  h(Toggle, {
-                    checked: dohEnabled,
-                    label: t('settings.doh'),
-                    onChange: requestDohToggle,
-                  }),
-                  h('span', null, t('settings.doh')),
-                ),
-                h(
-                  'select',
-                  {
-                    className: 'mtd-input mtd-select',
-                    value: dohProvider,
-                    disabled: !dohEnabled,
-                    'aria-label': t('settings.dohProvider'),
-                    onChange: (event) => changeDohProvider(event.target.value),
-                  },
-                  h('option', { value: 'cloudflare' }, 'Cloudflare'),
-                  h('option', { value: 'alidns' }, 'AliDNS'),
-                  h('option', { value: 'tencent' }, 'Tencent'),
-                ),
-                h('span', { className: 'mtd-setting-hint' }, t('settings.dohHint')),
-              ),
-              h(
-                'div',
-                { className: 'mtd-setting-row' },
-                h(
-                  'label',
-                  { className: 'mtd-switch-row' },
-                  h(Toggle, {
-                    checked: githubEnabled,
-                    label: t('settings.github'),
-                    onChange: (next) => {
-                      setGithubEnabled(next)
-                      void saveFlags({ githubEnabled: next })
-                    },
-                  }),
-                  h('span', null, t('settings.github')),
-                ),
-                h('span', { className: 'mtd-setting-hint' }, t('settings.githubHint')),
-              ),
-              h(
-                'div',
-                { className: 'mtd-setting-row' },
-                h('span', { className: 'mtd-setting-label' }, t('settings.rate')),
-                h('input', {
-                  id: 'mtd-rate',
-                  className: 'mtd-input mtd-threshold',
-                  type: 'text',
-                  inputMode: 'numeric',
-                  value: rate,
-                  'aria-label': t('settings.rate'),
-                  onChange: (event) => setRate(event.target.value),
-                  onBlur: saveRate,
-                  onKeyDown: (event) => {
-                    if (event.key !== 'Enter') return
-                    event.preventDefault()
-                    void saveRate()
-                    event.currentTarget.blur()
-                  },
-                }),
-                h('span', { className: 'mtd-setting-hint' }, t('settings.rateHint')),
-              ),
-              h(
-                'div',
-                { className: 'mtd-setting-row' },
-                h('span', { className: 'mtd-setting-label' }, t('settings.concurrency')),
-                h(
-                  'select',
-                  {
-                    className: 'mtd-input mtd-select',
-                    value: concurrency,
-                    'aria-label': t('settings.concurrency'),
-                    onChange: (event) => void saveConcurrency(event.target.value),
-                  },
-                  ['1', '2', '3', '4', '5', '6', '7', '8'].map((value) => h('option', { key: value, value }, value)),
-                ),
-                h('span', { className: 'mtd-setting-hint' }, t('settings.concurrencyHint')),
               ),
             ),
             h(
@@ -1456,8 +1678,46 @@ button:has(> span > .mtd-icon) { position: relative; }
               h('span', null, `${t('stats.active')} `, h('b', null, String(active))),
               h('span', null, `${t('stats.finished')} `, h('b', null, String(finished))),
               h('span', null, `${t('stats.speed')} `, h('b', null, formatSpeed(speed))),
+              etaSeconds > 0 ? h('span', null, `${t('stats.eta')} `, h('b', null, formatEta(etaSeconds))) : null,
               h('span', null, `${t('stats.tasks')} `, h('b', null, String(tasks.length))),
+              h('span', null, `${t('stats.connections')} `, h('b', null, `${meta === null || meta.activeConnections === undefined ? 0 : meta.activeConnections}/${effectiveConnections}`)),
+              resources === null
+                ? null
+                : h(
+                    'span',
+                    { title: t('stats.effective') },
+                    `${t('stats.load')} `,
+                    h(
+                      'b',
+                      null,
+                      [
+                        resources.cpuPct === null || resources.cpuPct === undefined ? 'CPU –' : `CPU ${resources.cpuPct}%`,
+                        resources.memoryPct === null || resources.memoryPct === undefined ? null : `内存 ${resources.memoryPct}%`,
+                        resources.enabled === false ? null : t(`load.level.${resources.level ?? 'normal'}`),
+                      ].filter(Boolean).join(' · '),
+                    ),
+                  ),
             ),
+            sites.length === 0
+              ? null
+              : h(
+                  'div',
+                  { className: 'mtd-card mtd-sites' },
+                  h('div', { className: 'mtd-sites-title' }, t('site.title')),
+                  sites.map((site) => {
+                    const cooldown = Math.max(0, Math.ceil(((site.cooldownUntil ?? 0) - Date.now()) / 1000))
+                    return h(
+                      'div',
+                      { className: 'mtd-site-row', key: site.key },
+                      h('span', { className: 'mtd-site-key' }, site.key),
+                      h('span', { className: `mtd-chip ${cooldown > 0 ? 'paused' : 'downloading'}` }, `L${site.level}`),
+                      h('span', null, fill(t('site.connections'), { count: site.connections })),
+                      site.rateBytes > 0 ? h('span', null, formatSpeed(site.rateBytes)) : null,
+                      cooldown > 0 ? h('span', null, fill(t('site.cooldown'), { seconds: cooldown })) : null,
+                      h('span', { className: 'mtd-site-note' }, fill(t('site.note'), { status: site.lastStatus, signals: site.signals })),
+                    )
+                  }),
+                ),
             tasks.length === 0
               ? h(
                   'div',
@@ -1597,7 +1857,7 @@ button:has(> span > .mtd-icon) { position: relative; }
           ? tasks[0].filename
           : tasks[0].url
       const size = formatBytePair(summary.receivedBytes, summary.totalBytes)
-      const meta = `${size} · ${Math.round(pct * 100)}%${summary.speed > 0 ? ` · ${formatSpeed(summary.speed)}` : ''}`
+      const meta = `${size} · ${Math.round(pct * 100)}%${summary.speed > 0 ? ` · ${formatSpeed(summary.speed)}` : ''}${summary.etaSeconds > 0 ? ` · ${fill(t('task.eta'), { eta: formatEta(summary.etaSeconds) })}` : ''}`
       const segments = dockSegments(tasks)
 
       return h(

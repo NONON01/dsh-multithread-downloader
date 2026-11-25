@@ -1,0 +1,1 @@
+- [dsh-multithread-downloader](https://github.com/NONON01/dsh-multithread-downloader) — 多线程 HTTP/HTTPS 下载：Range 分片、断点续传与 ETag 校验，向 Agent 提供 downloader / doh_lookup / http_probe 工具与进度面板 · `dsh plugin add dsh-multithread-downloader`

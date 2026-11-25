@@ -9,7 +9,7 @@
 
 ## 描述
 
-Host 端分片并发下载到本机，支持断点续传、自定义请求头、镜像回退、批量 URL、SHA-256 校验、全局限速和并发队列。Web GUI 提供侧边栏面板、对话进度条与未完成计数；Agent 通过 `downloader` 工具使用，小文件可静默下载。
+Host 端分片并发下载到本机，支持断点续传（ETag/Last-Modified 指纹复核 + If-Range）、自定义请求头、镜像回退、批量 URL、五种算法校验（md5/sha1/sha256/sha512/crc32）、全局限速与全局连接预算。自适应：按设备 CPU/内存负载收缩并发、按站点风控降档并单独限速（不同站点互不影响）。Web GUI 提供侧边栏面板、对话进度条、设置卡片与速度曲线；Agent 通过 `downloader` 工具使用，小文件可静默下载。另附 `doh_lookup`（DoH 解析）与 `http_probe`（只发 HEAD 探测大小/Range/ETag），两者不占下载连接。
 
 ## 权限说明
 

@@ -5,37 +5,83 @@
  * 并向 agent 注册 `downloader` 工具。UI 与工具调用同一套 Downloader 方法。
  */
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { spawn, spawnSync } from 'node:child_process'
-import { mkdir, open, readFile, readdir, rename, statfs, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { lookup as systemLookup } from 'node:dns'
-import { isIP } from 'node:net'
-import { basename, dirname, extname, isAbsolute, join, parse, resolve, sep } from 'node:path'
-import { createHash, randomUUID } from 'node:crypto'
-import { fileURLToPath } from 'node:url'
-import { Agent, fetch as undiciFetch } from 'undici'
+import { join, parse, resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import {
+  NATIVE_PICKER,
+  SETTINGS_SCHEMA_VERSION,
+  autoThreadsForBytes,
+  browseDirectory,
+  defaultDownloadDirectory,
+  electronDialog,
+  filenameFromUrl,
+  freeDiskBytes,
+  pickNativeDirectory,
+  readSettingsFile,
+  sanitizeFilename,
+  uniqueName,
+} from './lib/files.js'
+import {
+  MAX_ATTEMPTS,
+  USER_AGENT,
+  describeHttpError,
+  fetchWithRedirects,
+  fingerprintChange,
+  httpErrorFor,
+  httpStatusOf,
+  ifRangeValue,
+  isRetryable,
+  parseGithubReleaseUrl,
+  parseHttpUrl,
+  probe,
+  resolveGithubAsset,
+  retryDelay,
+  sanitizeHeaders,
+} from './lib/net.js'
+import { CHECKSUM_ALGORITHMS, fileChecksum, fileSha256, normalizeChecksum } from './lib/checksum.js'
+import {
+  ConnectionSlots,
+  LoadGovernor,
+  RISK_RETRY_LIMIT,
+  RISK_STATUS,
+  RateLimiter,
+  ResourceSampler,
+  SITE_LEVELS,
+  SiteGovernor,
+  SiteLimiter,
+  cpuPercentBetween,
+  loadStepFor,
+  siteKeyForUrl,
+  sleep,
+} from './lib/limits.js'
+import { DOH_PROVIDERS, createDohDispatcher, ipFamilyOf, normalizeDohProvider, resolverFor } from './lib/doh.js'
 
 const API_PREFIX = '/api/mtd'
 const MAX_THREADS = 16
 const MAX_TASKS = 100
+/**
+ * 全局并发上限（连接数）：并发 = 任务数 × 每条任务的线程数。
+ * 用户可在面板调整，Agent 自主模式同样受它约束；设备高负载时实际生效值会被临时调低。
+ */
+const DEFAULT_MAX_CONNECTIONS = 16
+const MAX_CONNECTIONS = 64
+/** 同时活跃的任务数上限，避免大量任务各占一个文件句柄；实际还受连接预算约束。 */
+const MAX_ACTIVE_TASKS = 32
+/** 每个连接一次最多读这么多，读完让出槽位，保证多任务在预算内轮转而不是被一个任务占满。 */
+const CONNECTION_PIECE_BYTES = 4 * 1024 * 1024
 const MIN_CHUNK_BYTES = 512 * 1024
 /** 超过该大小的任务才记录并返回进度采样历史（面板据此绘制曲线）。 */
 const DEFAULT_LARGE_FILE_MB = 16
 const DEFAULT_MIN_THREAD_MB = 4
 const HISTORY_LIMIT = 240
-const MAX_ATTEMPTS = 4
-const REQUEST_TIMEOUT_MS = 30_000
-const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504])
-const FORBIDDEN_HEADERS = new Set(['range', 'if-range', 'content-length', 'host', 'connection', 'accept-encoding'])
 const DISK_MARGIN_BYTES = 32 * 1024 * 1024
-const USER_AGENT = 'DSH-MultithreadDownloader/1.0'
-const DOH_PROVIDERS = {
-  cloudflare: { label: 'Cloudflare', url: 'https://cloudflare-dns.com/dns-query' },
-  alidns: { label: 'AliDNS', url: 'https://dns.alidns.com/resolve' },
-  tencent: { label: 'Tencent', url: 'https://doh.pub/dns-query' },
-}
-/** 随插件分发的 Windows 原生目录选择器。 */
-const NATIVE_PICKER = join(dirname(fileURLToPath(import.meta.url)), 'bin', 'picker.exe')
+/**
+ * 分片正文空闲超时：服务端回了响应头却迟迟不发数据（弱网、半死连接、中间设备黑洞），
+ * 不能让这个分片永远占着全局连接槽。超过这个时间没有新字节就中断并重试。
+ */
+const BODY_IDLE_TIMEOUT_MS = 30_000
 const JSON_HEADERS = {
   'content-type': 'application/json; charset=utf-8',
   'cache-control': 'no-store',
@@ -48,6 +94,11 @@ function numberConfig(value, fallback, min, max) {
   return Math.min(max, Math.max(min, Math.trunc(parsed)))
 }
 
+/** 并发限制数（连接数）收敛到合法区间。 */
+function clampConnections(value) {
+  return numberConfig(value, DEFAULT_MAX_CONNECTIONS, 1, MAX_CONNECTIONS)
+}
+
 /** 当前 profile 目录：优先环境变量，退回 ~/.dsh/profiles/<name>。 */
 function resolveProfileDirectory() {
   const fromEnv = process.env.DSH_PROFILE_DIR
@@ -58,668 +109,14 @@ function resolveProfileDirectory() {
   return join(homedir(), '.dsh', 'profiles', name)
 }
 
-/** 展开 Windows 注册表里的 %VAR%，保持原样表示无法展开。 */
-function expandWindowsEnvironment(value) {
-  return value.replace(/%([^%]+)%/g, (match, name) => {
-    const key = Object.keys(process.env).find((candidate) => candidate.toLowerCase() === name.toLowerCase())
-    return key === undefined ? match : process.env[key]
-  })
-}
 
-/** Windows 的“下载” Known Folder，支持被重定向到 OneDrive/D: 等位置。 */
-function windowsDownloadDirectory() {
-  try {
-    const result = spawnSync(
-      'reg',
-      [
-        'query',
-        'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders',
-        '/v',
-        '{374DE290-123F-4565-9164-39C4925E467B}',
-      ],
-      { encoding: 'utf8', windowsHide: true, timeout: 1500 },
-    )
-    if (result.status !== 0 || typeof result.stdout !== 'string') return ''
-    const match = /REG_\w+\s+(.+?)\r?$/m.exec(result.stdout)
-    if (match === null) return ''
-    const expanded = expandWindowsEnvironment(match[1].trim())
-    return isAbsolute(expanded) ? expanded : ''
-  } catch {
-    return ''
-  }
-}
 
-/** Linux 的 XDG 下载目录（~/.config/user-dirs.dirs）。 */
-function xdgDownloadDirectory(home) {
-  try {
-    const text = readFileSync(join(home, '.config', 'user-dirs.dirs'), 'utf8')
-    const match = /^XDG_DOWNLOAD_DIR="(.+)"$/m.exec(text)
-    if (match === null) return ''
-    const value = match[1].replace(/^\$HOME/, home)
-    return isAbsolute(value) ? value : ''
-  } catch {
-    return ''
-  }
-}
 
-/** 尝试拿到 Electron 的 dialog；非 Electron Host 返回 null。 */
-async function electronDialog() {
-  if (!process.versions.electron) return null
-  try {
-    const electron = await import('electron')
-    const dialog = electron.dialog ?? electron.default?.dialog
-    return dialog !== undefined && dialog !== null && typeof dialog.showOpenDialog === 'function' ? dialog : null
-  } catch {
-    return null
-  }
-}
 
-/** 调用随包分发的 Windows 原生选择器（IFileOpenDialog）。 */
-function pickWindowsHelper(title, initial) {
-  return new Promise((resolve, reject) => {
-    const args = ['--title', title]
-    if (typeof initial === 'string' && initial.trim() !== '') args.push('--initial', initial.trim())
-    const child = spawn(NATIVE_PICKER, args, { windowsHide: true })
-    let stdout = ''
-    let stderr = ''
-    child.stdout.on('data', (chunk) => { stdout += chunk })
-    child.stderr.on('data', (chunk) => { stderr += chunk })
-    child.on('error', reject)
-    child.on('close', (code) => {
-      if (code === 0) {
-        resolve(stdout.trim() === '' ? null : stdout.trim())
-        return
-      }
-      if (code === 2) {
-        resolve(null)
-        return
-      }
-      reject(new Error(stderr.trim() !== '' ? stderr.trim() : `native picker exited ${code}`))
-    })
-  })
-}
 
-/** 运行一个外部选择器进程；取消返回 null，启动失败抛错。 */
-function runPickerProcess(command, args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { windowsHide: true })
-    let stdout = ''
-    let stderr = ''
-    child.stdout.on('data', (chunk) => { stdout += chunk })
-    child.stderr.on('data', (chunk) => { stderr += chunk })
-    child.on('error', reject)
-    child.on('close', (code) => {
-      if (code === 0) {
-        const picked = stdout.trim()
-        resolve(picked === '' ? null : picked)
-        return
-      }
-      if (code === 1) {
-        resolve(null)
-        return
-      }
-      reject(new Error(stderr.trim() !== '' ? stderr.trim() : `${command} exited ${code}`))
-    })
-  })
-}
 
-/** macOS 原生目录选择。 */
-function pickMacDirectory(title) {
-  const literal = JSON.stringify(title)
-  return runPickerProcess('osascript', ['-e', `POSIX path of (choose folder with prompt ${literal})`])
-}
 
-/** Linux 原生目录选择：zenity 优先，其次 kdialog。 */
-async function pickLinuxDirectory(title) {
-  try {
-    return await runPickerProcess('zenity', ['--file-selection', '--directory', '--title', title])
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error
-  }
-  return runPickerProcess('kdialog', ['--getexistingdirectory', process.env.HOME ?? '/', '--title', title])
-}
 
-/** 原生目录选择：Electron 对话框优先，其次随包 Windows 选择器。 */
-async function pickNativeDirectory(title, initial) {
-  const dialog = await electronDialog()
-  if (dialog !== null) {
-    const result = await dialog.showOpenDialog({ title, properties: ['openDirectory', 'createDirectory'] })
-    if (result.canceled || result.filePaths.length === 0) return null
-    return result.filePaths[0]
-  }
-  if (process.platform === 'win32' && existsSync(NATIVE_PICKER)) return pickWindowsHelper(title, initial)
-  if (process.platform === 'darwin') return pickMacDirectory(title)
-  if (process.platform === 'linux') return pickLinuxDirectory(title)
-  return undefined
-}
-
-/** 列出一层目录，供面板的目录浏览器使用。 */
-async function browseDirectory(input) {
-  const home = homedir()
-  const target = typeof input === 'string' && input.trim() !== '' ? resolve(input.trim()) : home
-  const dirents = await readdir(target, { withFileTypes: true })
-  const entries = dirents
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => ({
-      name: entry.name,
-      path: join(target, entry.name),
-      hidden: entry.name.startsWith('.'),
-    }))
-    .sort((left, right) => left.name.localeCompare(right.name))
-  const truncated = entries.length > 500
-  const root = parse(target).root
-  const crumbs = [{ name: root.endsWith(sep) ? root.slice(0, -1) || root : root, path: root }]
-  let current = root
-  for (const part of target.slice(root.length).split(sep).filter((segment) => segment !== '')) {
-    current = join(current, part)
-    crumbs.push({ name: part, path: current })
-  }
-  return {
-    path: target,
-    home,
-    crumbs,
-    entries: truncated ? entries.slice(0, 500) : entries,
-    truncated,
-  }
-}
-
-/** 解析默认下载目录：配置 > Known Folder > 用户主目录/Downloads。 */
-function defaultDownloadDirectory() {
-  const home = homedir()
-  if (process.platform === 'win32') {
-    const known = windowsDownloadDirectory()
-    if (known !== '') return known
-  } else if (process.platform === 'linux') {
-    const xdg = xdgDownloadDirectory(home)
-    if (xdg !== '') return xdg
-  }
-  return join(home, 'Downloads')
-}
-
-/** 读取持久化的阈值设置；损坏或缺失时返回空对象。 */
-function readSettingsFile(path) {
-  try {
-    const data = JSON.parse(readFileSync(path, 'utf8'))
-    const settings = {}
-    const bytes = Number(data.largeFileBytes)
-    const minThreadBytes = Number(data.minThreadBytes)
-    const minThreadMb = Number(data.minThreadMb)
-    if (Number.isFinite(bytes)) settings.largeFileBytes = bytes
-    if (Number.isFinite(minThreadBytes)) settings.minThreadBytes = minThreadBytes
-    else if (Number.isFinite(minThreadMb)) settings.minThreadMb = minThreadMb
-    if (typeof data.minThreadEnabled === 'boolean') settings.minThreadEnabled = data.minThreadEnabled
-    if (typeof data.silentEnabled === 'boolean') settings.silentEnabled = data.silentEnabled
-    if (typeof data.agentAutonomy === 'boolean') settings.agentAutonomy = data.agentAutonomy
-    if (typeof data.autoThreads === 'boolean') settings.autoThreads = data.autoThreads
-    if (typeof data.fingerprintResume === 'boolean') settings.fingerprintResume = data.fingerprintResume
-    if (Number.isFinite(data.rateLimitBytes)) settings.rateLimitBytes = data.rateLimitBytes
-    if (Number.isFinite(data.maxConcurrent)) settings.maxConcurrent = data.maxConcurrent
-    if (typeof data.dohEnabled === 'boolean') settings.dohEnabled = data.dohEnabled
-    if (typeof data.dohProvider === 'string') settings.dohProvider = data.dohProvider
-    if (typeof data.githubEnabled === 'boolean') settings.githubEnabled = data.githubEnabled
-    return settings
-  } catch {
-    return {}
-  }
-}
-
-/** URL 只接受 http/https。 */
-function parseHttpUrl(raw) {
-  let url
-  try {
-    url = new URL(String(raw ?? '').trim())
-  } catch {
-    throw new Error('无效的 URL')
-  }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('只支持 http/https URL')
-  return url
-}
-
-/** 从 Content-Disposition 取文件名（兼容 filename*）。 */
-function filenameFromDisposition(value) {
-  if (typeof value !== 'string' || value === '') return ''
-  const extended = /filename\*\s*=\s*(?:UTF-8'')?([^;]+)/i.exec(value)
-  if (extended !== null) {
-    try {
-      return decodeURIComponent(extended[1].trim().replace(/^"|"$/g, ''))
-    } catch {
-      /* 忽略损坏的 filename* */
-    }
-  }
-  const plain = /filename\s*=\s*"([^"]+)"/i.exec(value) ?? /filename\s*=\s*([^;]+)/i.exec(value)
-  return plain === null ? '' : plain[1].trim()
-}
-
-/** 去掉 Windows 不允许的字符，避免路径逃逸。 */
-function sanitizeFilename(name) {
-  const cleaned = String(name ?? '')
-    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
-    .replace(/^\.+$/, '')
-    .trim()
-    .replace(/[. ]+$/, '')
-    .slice(0, 180)
-  if (cleaned === '') return ''
-  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i.test(cleaned)) return `_${cleaned}`
-  return cleaned
-}
-
-/** 从 URL 推断文件名。 */
-function filenameFromUrl(url) {
-  const raw = decodeURIComponent(url.pathname.split('/').pop() ?? '')
-  const cleaned = sanitizeFilename(raw)
-  return cleaned === '' ? 'download.bin' : cleaned
-}
-
-/** 目标目录里重名时追加 (n)。 */
-async function uniqueName(dir, name, reserved) {
-  const extension = extname(name)
-  const stem = extension === '' ? name : name.slice(0, -extension.length)
-  let candidate = name
-  for (let index = 1; index < 1000; index += 1) {
-    const target = join(dir, candidate)
-    if (!(reserved?.has(target) ?? false)) {
-      try {
-        await open(target, 'r').then((handle) => handle.close())
-      } catch (error) {
-        if (error?.code === 'ENOENT') return candidate
-        throw error
-      }
-    }
-    candidate = `${stem} (${index})${extension}`
-  }
-  return `${stem}-${Date.now()}${extension}`
-}
-
-/**
- * 分片数阶梯：仅在调用方没有显式指定线程数、且开启 autoThreads 时生效。
- * 小文件本来就受单线程阈值约束，这里只负责中大型文件别一直用 4 条连接。
- */
-function autoThreadsForBytes(size) {
-  if (!Number.isFinite(size) || size <= 0) return 1
-  if (size < 32 * 1024 * 1024) return 4
-  if (size < 256 * 1024 * 1024) return 6
-  return 8
-}
-
-/** 比较两次探测结果；返回到变化的字段名，未变化返回空串。 */
-function fingerprintChange(before, after) {
-  if (before === null || before === undefined || after === null || after === undefined) return ''
-  const beforeSize = Number(before.size) || 0
-  const afterSize = Number(after.size) || 0
-  if (beforeSize > 0 && afterSize > 0 && beforeSize !== afterSize) return 'size'
-  const beforeEtag = typeof before.etag === 'string' ? before.etag : ''
-  const afterEtag = typeof after.etag === 'string' ? after.etag : ''
-  if (beforeEtag !== '' && afterEtag !== '' && beforeEtag !== afterEtag) return 'etag'
-  const beforeModified = typeof before.lastModified === 'string' ? before.lastModified : ''
-  const afterModified = typeof after.lastModified === 'string' ? after.lastModified : ''
-  if (beforeModified !== '' && afterModified !== '' && beforeModified !== afterModified) return 'last-modified'
-  return ''
-}
-
-/** If-Range 只接受强 ETag；弱 ETag（W/"…"）按规范必须回退到 Last-Modified。 */
-function ifRangeValue(etag, lastModified) {
-  if (typeof etag === 'string' && etag !== '' && !/^W\//i.test(etag)) return etag
-  if (typeof lastModified === 'string' && lastModified !== '') return lastModified
-  return ''
-}
-
-/** 把 401/403/407 这类状态转成可操作的提示。 */
-function describeHttpError(status) {
-  if (status === 401 || status === 403) {
-    return `HTTP ${status}：需要登录或防盗链，请通过 headers 提供 Cookie / Referer / Authorization`
-  }
-  if (status === 407) return 'HTTP 407：需要代理认证'
-  return `HTTP ${status}`
-}
-
-/** 探测大小、Range 支持与文件名。 */
-async function probeOnce(url, signal, extraHeaders = {}, dispatcher = undefined) {
-  const headers = { 'accept-encoding': 'identity', 'user-agent': USER_AGENT, ...extraHeaders }
-  let size = 0
-  let ranges = false
-  let filename = ''
-  let etag = ''
-  let lastModified = ''
-  try {
-    const fetched = await fetchWithRedirects(url, { method: 'HEAD', headers, dispatcher }, signal)
-    const head = fetched.response
-    fetched.release()
-    if (head.ok) {
-      size = Number(head.headers.get('content-length') ?? 0) || 0
-      ranges = (head.headers.get('accept-ranges') ?? '').toLowerCase().includes('bytes')
-      filename = filenameFromDisposition(head.headers.get('content-disposition'))
-      etag = head.headers.get('etag') ?? ''
-      lastModified = head.headers.get('last-modified') ?? ''
-    }
-  } catch (error) {
-    if (signal.aborted) throw error
-  }
-  if (size > 0 && ranges) return { size, ranges, filename, etag, lastModified }
-
-  const fetched = await fetchWithRedirects(url, { headers: { ...headers, range: 'bytes=0-0' }, dispatcher }, signal)
-  const response = fetched.response
-  if (response.status === 206) {
-    const match = /\/(\d+)\s*$/.exec(response.headers.get('content-range') ?? '')
-    const total = match === null ? 0 : Number(match[1])
-    if (total > 0) size = total
-    ranges = true
-    filename = filename || filenameFromDisposition(response.headers.get('content-disposition'))
-    etag = etag || response.headers.get('etag') || ''
-    lastModified = lastModified || response.headers.get('last-modified') || ''
-    await response.body?.cancel().catch(() => {})
-    fetched.release()
-  } else if (response.ok) {
-    if (size === 0) size = Number(response.headers.get('content-length') ?? 0) || 0
-    filename = filename || filenameFromDisposition(response.headers.get('content-disposition'))
-    await response.body?.cancel().catch(() => {})
-    fetched.release()
-  } else {
-    fetched.release()
-    throw new Error(describeHttpError(response.status))
-  }
-  return { size, ranges: ranges && size > 0, filename, etag, lastModified }
-}
-
-/** 带重试的探测；401/403 等不可重试错误直接抛出。 */
-async function probe(url, signal, extraHeaders = {}, dispatcher = undefined) {
-  let lastError
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    try {
-      return await probeOnce(url, signal, extraHeaders, dispatcher)
-    } catch (error) {
-      lastError = error
-      const status = /^HTTP (\d+)/.exec(error instanceof Error ? error.message : '')
-      if (signal.aborted || !isRetryable(error, status === null ? undefined : Number(status[1]))) throw error
-      if (attempt >= MAX_ATTEMPTS) break
-      await sleep(retryDelay(attempt))
-    }
-  }
-  throw lastError
-}
-
-/** 收敛 DoH 提供商；未知值回退 AliDNS。 */
-function normalizeDohProvider(value) {
-  return Object.hasOwn(DOH_PROVIDERS, value) ? value : 'alidns'
-}
-
-/** 创建一个走 DoH 的 undici dispatcher；解析失败时回退系统 DNS。 */
-function createDohDispatcher(provider) {
-  const endpoint = DOH_PROVIDERS[normalizeDohProvider(provider)].url
-  const cache = new Map()
-
-  const query = async (hostname, type) => {
-    const key = `${type}:${hostname}`
-    const cached = cache.get(key)
-    if (cached !== undefined && cached.expires > Date.now()) return cached.addresses
-    const target = new URL(endpoint)
-    target.searchParams.set('name', hostname)
-    target.searchParams.set('type', type)
-    const response = await undiciFetch(target, {
-      headers: { accept: 'application/dns-json' },
-      signal: AbortSignal.timeout(5000),
-    })
-    if (!response.ok) throw new Error(`DoH HTTP ${response.status}`)
-    const data = await response.json()
-    const wanted = type === 'A' ? 1 : 28
-    const addresses = Array.isArray(data.Answer)
-      ? data.Answer.filter((answer) => answer.type === wanted).map((answer) => answer.data)
-      : []
-    cache.set(key, { addresses, expires: Date.now() + 60_000 })
-    return addresses
-  }
-
-  const lookup = (hostname, options, callback) => {
-    if (isIP(hostname) !== 0) {
-      systemLookup(hostname, options, callback)
-      return
-    }
-    Promise.all([
-      query(hostname, 'A'),
-      query(hostname, 'AAAA').catch(() => []),
-    ]).then(([ipv4, ipv6]) => {
-      const addresses = [
-        ...ipv4.map((address) => ({ address, family: 4 })),
-        ...ipv6.map((address) => ({ address, family: 6 })),
-      ]
-      if (addresses.length === 0) throw new Error(`DoH 没有解析结果：${hostname}`)
-      if (options?.all === true) callback(null, addresses)
-      else callback(null, addresses[0].address, addresses[0].family)
-    }).catch(() => {
-      // DoH 不可用时保持可用性；风险提示会说明存在回退。
-      systemLookup(hostname, options, callback)
-    })
-  }
-
-  return new Agent({ connect: { lookup } })
-}
-
-/** 解析 GitHub Release 直链：owner/repo/releases/download/tag/file。 */
-function parseGithubReleaseUrl(raw) {
-  const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/releases\/download\/(.+)\/([^/]+)$/.exec(raw)
-  if (match === null) return null
-  return {
-    owner: match[1],
-    repo: match[2],
-    tag: decodeURIComponent(match[3]),
-    asset: decodeURIComponent(match[4]),
-  }
-}
-
-/** 把 GitHub Release 直链换成 API 资产链接，避免 github.com 被污染。 */
-async function resolveGithubAsset(raw) {
-  const parsed = parseGithubReleaseUrl(raw)
-  if (parsed === null) return null
-  const api = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/releases/tags/${encodeURIComponent(parsed.tag)}`
-  const response = await undiciFetch(api, {
-    headers: { accept: 'application/vnd.github+json', 'user-agent': USER_AGENT },
-    signal: AbortSignal.timeout(15_000),
-  })
-  if (!response.ok) throw new Error(`GitHub API HTTP ${response.status}`)
-  const release = await response.json()
-  const asset = Array.isArray(release.assets)
-    ? release.assets.find((entry) => entry.name === parsed.asset)
-    : undefined
-  if (asset === undefined) throw new Error(`GitHub Release 中找不到资产：${parsed.asset}`)
-  return {
-    url: asset.url,
-    headers: { accept: 'application/octet-stream' },
-  }
-}
-
-/** 规范化用户提供的请求头：去掉换行、禁止覆盖 Range 等由下载器控制的头。 */
-function sanitizeHeaders(input) {
-  if (input === undefined || input === null) return {}
-  if (typeof input !== 'object' || Array.isArray(input)) throw new Error('headers 需为键值对象')
-  const entries = Object.entries(input)
-  if (entries.length > 30) throw new Error('headers 不能超过 30 项')
-  const headers = {}
-  let size = 0
-  for (const [rawKey, rawValue] of entries) {
-    const key = String(rawKey).trim().toLowerCase()
-    if (!/^[a-z0-9-]{1,64}$/.test(key)) throw new Error(`非法 header 名：${rawKey}`)
-    if (FORBIDDEN_HEADERS.has(key)) continue
-    const value = String(rawValue ?? '').replace(/[\r\n]/g, ' ').trim()
-    if (value === '') continue
-    size += key.length + value.length
-    if (size > 8192) throw new Error('headers 过大（上限 8 KB）')
-    headers[key] = value
-  }
-  return headers
-}
-
-/** 可重试的 HTTP 状态码或网络错误。 */
-function isRetryable(error, status) {
-  if (status !== undefined && RETRYABLE_STATUS.has(status)) return true
-  if (error === undefined || error === null) return false
-  if (error.name === 'AbortError') return false
-  return error.name === 'TypeError'
-    || ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'ERR_STREAM_PREMATURE_CLOSE'].includes(error.code)
-}
-
-/** 指数退避，最多 8 秒；有 Retry-After 时优先使用。 */
-function retryDelay(attempt, response) {
-  const retryAfter = response?.headers?.get('retry-after') ?? ''
-  if (/^\d+$/.test(retryAfter)) return Math.min(30_000, Number(retryAfter) * 1000)
-  return Math.min(8000, 500 * 2 ** Math.max(0, attempt - 1)) + Math.floor(Math.random() * 250)
-}
-
-/** 跟随重定向，并在跨源跳转时剥离敏感请求头；只给“拿到响应头”设超时。 */
-async function fetchWithRedirects(url, init, signal, maxHops = 5) {
-  let current = new URL(url)
-  let headers = { ...(init.headers ?? {}) }
-  for (let hop = 0; hop <= maxHops; hop += 1) {
-    const controller = new AbortController()
-    const forward = () => controller.abort()
-    if (signal.aborted) controller.abort()
-    else signal.addEventListener('abort', forward, { once: true })
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
-    let response
-    try {
-      response = await undiciFetch(current, { ...init, headers, redirect: 'manual', signal: controller.signal })
-    } catch (error) {
-      clearTimeout(timer)
-      signal.removeEventListener('abort', forward)
-      throw error
-    }
-    clearTimeout(timer)
-    if (![301, 302, 303, 307, 308].includes(response.status)) {
-      return { response, release: () => signal.removeEventListener('abort', forward) }
-    }
-    const location = response.headers.get('location')
-    await response.body?.cancel().catch(() => {})
-    signal.removeEventListener('abort', forward)
-    if (location === null) throw new Error(`HTTP ${response.status}`)
-    const next = new URL(location, current)
-    if (next.origin !== current.origin) {
-      headers = { ...headers }
-      for (const key of Object.keys(headers)) {
-        if (['cookie', 'authorization', 'proxy-authorization'].includes(key.toLowerCase())) delete headers[key]
-      }
-    }
-    current = next
-  }
-  throw new Error('重定向次数过多')
-}
-
-/** 支持的文件校验算法；hex 为规范化后的十六进制长度。 */
-const CHECKSUM_ALGORITHMS = Object.freeze({
-  md5: { label: 'MD5', hex: 32, node: 'md5' },
-  sha1: { label: 'SHA-1', hex: 40, node: 'sha1' },
-  sha256: { label: 'SHA-256', hex: 64, node: 'sha256' },
-  sha512: { label: 'SHA-512', hex: 128, node: 'sha512' },
-  crc32: { label: 'CRC32', hex: 8, node: null },
-})
-
-const CRC32_TABLE = (() => {
-  const table = new Uint32Array(256)
-  for (let index = 0; index < 256; index += 1) {
-    let value = index
-    for (let bit = 0; bit < 8; bit += 1) {
-      value = (value & 1) !== 0 ? (value >>> 1) ^ 0xedb88320 : value >>> 1
-    }
-    table[index] = value >>> 0
-  }
-  return table
-})()
-
-/** 流式计算文件校验值；支持 md5/sha1/sha256/sha512/crc32。 */
-async function fileChecksum(path, algorithm = 'sha256') {
-  const spec = CHECKSUM_ALGORITHMS[algorithm]
-  if (spec === undefined) throw new Error(`不支持的校验算法：${algorithm}`)
-  const handle = await open(path, 'r')
-  const hash = spec.node === null ? null : createHash(spec.node)
-  let crc = 0xffffffff
-  const buffer = Buffer.allocUnsafe(1024 * 1024)
-  try {
-    for (;;) {
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null)
-      if (bytesRead === 0) break
-      const block = buffer.subarray(0, bytesRead)
-      if (hash !== null) hash.update(block)
-      else {
-        for (const byte of block) crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8)
-      }
-    }
-  } finally {
-    await handle.close()
-  }
-  if (hash !== null) return hash.digest('hex')
-  return ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, '0')
-}
-
-/** 兼容旧调用：默认 SHA-256。 */
-async function fileSha256(path) {
-  return fileChecksum(path, 'sha256')
-}
-
-/** 把请求里的 checksum 或旧 sha256 参数规范化为 { algorithm, value }。 */
-function normalizeChecksum(request) {
-  const raw = request?.checksum
-  let algorithm = ''
-  let value = ''
-  if (raw !== undefined && raw !== null) {
-    if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error('checksum 需为 { algorithm, value } 对象')
-    algorithm = typeof raw.algorithm === 'string' ? raw.algorithm.trim().toLowerCase() : ''
-    value = typeof raw.value === 'string' ? raw.value.trim().toLowerCase() : ''
-  } else if (typeof request?.sha256 === 'string' && request.sha256.trim() !== '') {
-    algorithm = 'sha256'
-    value = request.sha256.trim().toLowerCase()
-  }
-  if (algorithm === '' && value === '') return null
-  const spec = CHECKSUM_ALGORITHMS[algorithm]
-  if (spec === undefined) throw new Error(`不支持的校验算法：${algorithm || '(空)'}（可选 md5/sha1/sha256/sha512/crc32）`)
-  if (!new RegExp(`^[a-f0-9]{${spec.hex}}$`).test(value)) {
-    throw new Error(`${spec.label} 需为 ${spec.hex} 位十六进制`)
-  }
-  return { algorithm, value }
-}
-
-/** 目标目录可用空间；不支持 statfs 时返回 null。 */
-async function freeDiskBytes(directory) {
-  try {
-    const info = await statfs(directory)
-    const blockSize = Number(info.bsize)
-    const available = Number(info.bavail)
-    if (!Number.isFinite(blockSize) || !Number.isFinite(available)) return null
-    return blockSize * available
-  } catch {
-    return null
-  }
-}
-
-/** 全局令牌桶限速；rate 为字节/秒，0 表示不限。 */
-class RateLimiter {
-  constructor(rate) {
-    this.rate = rate
-    this.tokens = 0
-    this.last = Date.now()
-    this.chain = Promise.resolve()
-  }
-
-  setRate(rate) {
-    this.rate = rate
-    this.last = Date.now()
-    this.tokens = 0
-  }
-
-  take(bytes) {
-    if (this.rate <= 0 || bytes <= 0) return Promise.resolve()
-    this.chain = this.chain.then(async () => {
-      const now = Date.now()
-      this.tokens = Math.min(this.rate, this.tokens + ((now - this.last) / 1000) * this.rate)
-      this.last = now
-      this.tokens -= bytes
-      if (this.tokens >= 0) return
-      const wait = Math.max(1, Math.ceil((-this.tokens / this.rate) * 1000))
-      this.tokens = 0
-      await sleep(wait)
-      this.last = Date.now()
-    })
-    return this.chain
-  }
-}
-
-const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
 
 /** 一个下载任务。 */
 class DownloadTask {
@@ -748,9 +145,17 @@ class DownloadTask {
     /** 指纹状态：''（无校验值）/ verified / unverified / changed。 */
     this.fingerprintState = ''
     this.fingerprintNote = ''
+    /** 站点风控：本次任务已因风控整体重试的次数，以及给用户看的说明。 */
+    this.riskRetries = 0
+    this.riskNote = ''
+    this.lastRiskAt = 0
     this.freshRestart = false
     this.superseded = false
     this.resetFile = false
+    /** 416 只允许重建分片一次，避免与远端互相拉扯成死循环。 */
+    this.rangeRebuild = false
+    /** 每一轮 runChunks 的令牌；旧轮发现令牌变了就安静退出。 */
+    this.runToken = null
     this.status = 'queued'
     this.error = ''
     this.filename = input.filename
@@ -777,6 +182,14 @@ class DownloadTask {
   }
 
   snapshot(options = {}) {
+    const siteKey = siteKeyForUrl(this.url)
+    const site = siteKey === '' ? null : this.manager.siteGovernor.sites.get(siteKey)
+    const throttled = site !== undefined && site !== null && site.level > 0 ? site : null
+    const remainingBytes = this.totalBytes > 0 ? Math.max(0, this.totalBytes - this.receivedBytes) : 0
+    // 预估剩余时间：只在正在下载、速度有效、大小已知时给出，避免给出误导性的 0 或 Infinity。
+    const etaSeconds = this.status === 'downloading' && this.speed > 0 && remainingBytes > 0
+      ? Math.max(1, Math.round(remainingBytes / this.speed))
+      : null
     const snapshot = {
       id: this.id,
       url: this.sourceUrl || this.url,
@@ -787,15 +200,32 @@ class DownloadTask {
       error: this.error,
       totalBytes: this.totalBytes,
       receivedBytes: this.receivedBytes,
+      remainingBytes,
       progress: this.totalBytes > 0 ? Math.min(1, this.receivedBytes / this.totalBytes) : 0,
       speed: this.speed,
-      threads: this.chunks.length > 0 ? this.chunks.length : this.threads,
+      ...(etaSeconds === null ? {} : { etaSeconds }),
+      threads: throttled === null
+        ? (this.chunks.length > 0 ? this.chunks.length : this.threads)
+        : Math.min(this.chunks.length > 0 ? this.chunks.length : this.threads, Math.max(1, throttled.cap)),
       origin: this.origin,
       doh: this.doh,
       dohProvider: this.dohProvider,
       github: this.github,
       forceDisplay: this.forceDisplay,
       ...(this.checksum === null ? {} : { checksum: { ...this.checksum } }),
+      ...(siteKey === '' ? {} : { siteKey }),
+      ...(throttled === null
+        ? {}
+        : {
+            siteThrottle: {
+              level: throttled.level,
+              connections: throttled.cap,
+              rateBytes: throttled.rateBytes,
+              cooldownUntil: throttled.notBefore,
+            },
+          }),
+      ...(this.riskRetries > 0 ? { riskRetries: this.riskRetries } : {}),
+      ...(this.riskNote === '' ? {} : { riskNote: this.riskNote }),
       ...(this.fingerprintState === ''
         ? {}
         : {
@@ -831,6 +261,10 @@ class DownloadTask {
       headers: this.headers,
       checksum: this.checksum,
       origin: this.origin,
+      doh: this.doh,
+      dohProvider: this.dohProvider,
+      github: this.github,
+      forceDisplay: this.forceDisplay,
       threads: this.threads,
       threadsExplicit: this.threadsExplicit,
       singleThread: this.singleThread,
@@ -934,20 +368,57 @@ class DownloadTask {
     await unlink(path).catch(() => {})
   }
 
+  /** 当前正在使用的地址（镜像回退后会切换）。 */
+  currentUrl() {
+    return this.urls[this.urlIndex % this.urls.length]
+  }
+
+  /**
+   * 记录一次站点风控。同一波并发分片会同时收到 403，这里按 2 秒窗口去重，
+   * 让一波失败只降一档；返回 'exhausted' 表示该任务已经降无可降。
+   */
+  registerSiteRisk(url, status) {
+    const now = Date.now()
+    if (now - this.lastRiskAt < 2000) return 'retry'
+    if (this.riskRetries >= RISK_RETRY_LIMIT) return 'exhausted'
+    this.riskRetries += 1
+    this.lastRiskAt = now
+    const spec = this.manager.siteGovernor.penalize(url, status)
+    if (spec !== null) {
+      this.riskNote = `HTTP ${status}：站点触发风控，已降至 ${spec.cap} 连接 / ${Math.round(spec.rate / 1024)} KB/s，冷却 ${Math.round(spec.cooldownMs / 1000)} 秒后继续（第 ${this.riskRetries} 次）`
+    }
+    return 'retry'
+  }
+
   async probeAny() {
     let lastError
-    for (let index = 0; index < this.urls.length; index += 1) {
-      try {
-        const result = await probe(this.urls[index], this.abort.signal, this.headers, this.dispatcher())
-        this.url = this.urls[index]
-        this.urlIndex = index
-        return result
-      } catch (error) {
-        lastError = error
-        if (this.abort.signal.aborted) throw error
+    for (;;) {
+      let risk = null
+      for (let index = 0; index < this.urls.length; index += 1) {
+        try {
+          const site = this.manager.siteAdaptive ? this.manager.siteGovernor.limiterFor(this.urls[index]) : null
+          if (site !== null) await site.waitCooldown(this.abort.signal)
+          const result = await probe(this.urls[index], this.abort.signal, this.headers, this.dispatcher())
+          this.url = this.urls[index]
+          this.urlIndex = index
+          return result
+        } catch (error) {
+          lastError = error
+          if (this.abort.signal.aborted) throw error
+          const status = httpStatusOf(error)
+          if (status !== undefined && RISK_STATUS.has(status) && this.manager.siteAdaptive) {
+            if (this.registerSiteRisk(this.urls[index], status) === 'exhausted') {
+              throw new Error(`${describeHttpError(status)}（站点已限速重试 ${this.riskRetries} 次仍被拒绝）`)
+            }
+            risk = { url: this.urls[index] }
+            break
+          }
+        }
       }
+      if (risk === null) throw lastError
+      const site = this.manager.siteGovernor.limiterFor(risk.url)
+      if (site !== null) await site.waitCooldown(this.abort.signal)
     }
-    throw lastError
   }
 
   async run() {
@@ -1004,7 +475,9 @@ class DownloadTask {
     const target = this.threadsExplicit || !this.manager.autoThreads
       ? this.threads
       : autoThreadsForBytes(this.totalBytes)
-    const count = Math.max(1, Math.min(target, Math.floor(this.totalBytes / MIN_CHUNK_BYTES) || 1))
+    // 单个任务也不能超过全局连接预算，否则「并发 = 任务数 × 线程数」就不成立。
+    const budget = Math.max(1, Math.round(this.manager.maxConnections) || 1)
+    const count = Math.max(1, Math.min(target, budget, Math.floor(this.totalBytes / MIN_CHUNK_BYTES) || 1))
     const chunkSize = Math.ceil(this.totalBytes / count)
     const chunks = []
     for (let index = 0; index < count; index += 1) {
@@ -1016,83 +489,185 @@ class DownloadTask {
     return chunks
   }
 
-  async runChunk(chunk) {
+  /**
+   * 分片循环：每次向全局连接预算占一个槽，读完一小段（4 MB）就归还，
+   * 再重新排队，多个任务因此能轮转，而不是先来的任务一口气占满全部预算。
+   * 重试退避等待不占槽。所有任务共享同一个预算，Agent 指定的线程数也绕不过它。
+   */
+  async runChunk(chunk, run) {
     let attempts = 0
-    while (this.status === 'downloading' && !this.superseded) {
+    while (this.runToken === run && !this.superseded) {
       const position = chunk.start + chunk.cursor
       if (chunk.end >= 0 && position > chunk.end) return
-      let release = null
+      const url = this.currentUrl()
+      const site = this.manager.siteAdaptive ? this.manager.siteGovernor.limiterFor(url) : null
+      // 先占站点槽（含风控冷却），再占全局槽：冷却等待不该攥着全局连接不放，
+      // 否则一个被风控的站点会把其它站点的下载一起拖停。
+      const siteRelease = site === null ? null : await site.acquire(this.abort.signal)
+      if (site !== null && siteRelease === null) return
+      // 等槽位期间可能已被 pause/resume 换掉本轮：立刻交还站点槽并退出。
+      if (this.runToken !== run) {
+        if (siteRelease !== null) siteRelease()
+        return
+      }
+      let slot = null
+      let retry = false
+      let retryAfterMs = 0
+      let cooldownUrl = ''
       try {
-        const headers = { 'accept-encoding': 'identity', 'user-agent': USER_AGENT, ...this.headers }
-        // 续传/分片请求带上 If-Range：远端换了版本时服务器回 200，我们据此重新开始，而不是拼错内容。
-        const ifRange = chunk.end >= 0 ? ifRangeValue(this.etag, this.lastModified) : ''
-        if (chunk.end >= 0) {
-          headers.range = `bytes=${position}-${chunk.end}`
-          if (ifRange !== '') headers['if-range'] = ifRange
-        }
-        const url = this.urls[this.urlIndex % this.urls.length]
-        const fetched = await fetchWithRedirects(url, { headers, dispatcher: this.dispatcher() }, this.abort.signal)
-        release = fetched.release
-        const response = fetched.response
-        if (response.status === 401 || response.status === 403 || response.status === 407) {
-          await response.body?.cancel().catch(() => {})
-          throw new Error(describeHttpError(response.status))
-        }
-        if (response.status === 416 && chunk.end >= 0) return
-        if (!response.ok) throw new Error(`HTTP ${response.status}`)
-        if (chunk.end >= 0 && response.status === 200) {
-          await response.body?.cancel().catch(() => {})
-          if (ifRange !== '') {
-            this.superseded = true
-            this.fingerprintState = 'changed'
-            this.fingerprintNote = '下载过程中远端文件已变化，已自动从头重新下载'
-            const changed = new Error('远端文件已变化（If-Range 不匹配）')
-            changed.code = 'FINGERPRINT_CHANGED'
-            throw changed
-          }
-          const ignored = new Error('服务器忽略了 Range 请求')
-          ignored.code = 'RANGE_IGNORED'
-          throw ignored
-        }
-        if (chunk.end >= 0 && response.status !== 206) throw new Error(`HTTP ${response.status}`)
-        if (response.body === null) throw new Error('响应没有正文')
-        const reader = response.body.getReader()
-        let cursor = position
-        for (;;) {
-          const { done, value } = await reader.read()
-          if (done) break
-          if (this.status !== 'downloading' || this.superseded) {
-            await reader.cancel().catch(() => {})
-            return
-          }
-          if (this.handle === null) throw new Error('文件句柄已关闭')
-          await this.manager.limiter.take(value.length)
-          await this.handle.write(value, 0, value.length, cursor)
-          cursor += value.length
-          chunk.cursor = cursor - chunk.start
-          this.receivedBytes += value.length
-        }
-        if (this.status !== 'downloading') return
-        if (chunk.end < 0 || cursor > chunk.end) return
-        throw new Error('连接提前结束')
+        slot = await this.manager.slots.acquire(this.abort.signal)
+        if (slot === null) return
+        if (this.runToken !== run) return
+        // 单连接整段下载没有终点；分片只取一小段，让出槽位给其它任务。
+        const pieceEnd = chunk.end < 0 ? -1 : Math.min(chunk.end, position + CONNECTION_PIECE_BYTES - 1)
+        await this.pullChunk(chunk, position, pieceEnd, site, run)
+        // 这一段成功，退避计数清零：同一个分片的后续小段从头计数；
+        // 站点连续成功够了就回落一档，恢复并发与带宽。
+        attempts = 0
+        if (site !== null) site.reward()
       } catch (error) {
+        // 本轮已被换掉（pause 后立刻 resume、或重启重开）：不要动新一轮的状态。
+        if (this.runToken !== run) return
         // 已有分片发现远端变化：其它分片安静退出，由 runChunks 统一重开。
         if (this.superseded) {
           if (error?.code === 'FINGERPRINT_CHANGED') throw error
           return
         }
         if (this.status !== 'downloading' || this.abort.signal.aborted) return
-        const statusMatch = /^HTTP (\d+)/.exec(error instanceof Error ? error.message : '')
-        const status = statusMatch === null ? undefined : Number(statusMatch[1])
+        const status = httpStatusOf(error)
         const timedOut = error?.name === 'AbortError' && !this.abort.signal.aborted
-        if (!timedOut && !isRetryable(error, status)) throw error
-        attempts += 1
-        if (attempts >= MAX_ATTEMPTS) throw error
-        if (this.urls.length > 1) this.urlIndex = (this.urlIndex + 1) % this.urls.length
-        await sleep(retryDelay(attempts))
+        if (status !== undefined && RISK_STATUS.has(status) && this.manager.siteAdaptive) {
+          // 站点风控：降档 + 冷却后再来，重试预算与网络重试分开计。
+          if (this.registerSiteRisk(url, status) === 'exhausted') {
+            throw new Error(`${describeHttpError(status)}（站点已限速重试 ${this.riskRetries} 次仍被拒绝）`)
+          }
+          cooldownUrl = url
+          attempts = 0
+          retry = true
+        } else if (!timedOut && !isRetryable(error, status)) {
+          throw error
+        } else {
+          attempts += 1
+          if (attempts >= MAX_ATTEMPTS) throw error
+          if (this.urls.length > 1) this.urlIndex = (this.urlIndex + 1) % this.urls.length
+          retry = true
+          retryAfterMs = Number(error?.retryAfterMs) || 0
+        }
       } finally {
-        if (release !== null) release()
+        if (slot !== null) slot()
+        if (siteRelease !== null) siteRelease()
       }
+      // 冷却在槽位之外等待：让其它站点的任务继续跑。
+      if (cooldownUrl !== '') {
+        const cooled = this.manager.siteGovernor.limiterFor(cooldownUrl)
+        if (cooled !== null) await cooled.waitCooldown(this.abort.signal)
+      }
+      if (retry) await sleep(retryDelay(attempts, retryAfterMs))
+    }
+  }
+
+  /** 一次分段请求：发 Range、校验响应状态、把正文写进分片文件。 */
+  async pullChunk(chunk, position, pieceEnd, site = null, run = null) {
+    let release = null
+    try {
+      const headers = { 'accept-encoding': 'identity', 'user-agent': USER_AGENT, ...this.headers }
+      // 续传/分片请求带上 If-Range：远端换了版本时服务器回 200，我们据此重新开始，而不是拼错内容。
+      const ifRange = chunk.end >= 0 ? ifRangeValue(this.etag, this.lastModified) : ''
+      if (pieceEnd >= 0) {
+        headers.range = `bytes=${position}-${pieceEnd}`
+        if (ifRange !== '') headers['if-range'] = ifRange
+      }
+      const url = this.currentUrl()
+      const fetched = await fetchWithRedirects(url, { headers, dispatcher: this.dispatcher() }, this.abort.signal)
+      release = fetched.release
+      const response = fetched.response
+      if (response.status === 401 || response.status === 403 || response.status === 407) {
+        await response.body?.cancel().catch(() => {})
+        throw new Error(describeHttpError(response.status))
+      }
+      // 416 不是「本段已完成」：远端在说自己没有这个字节范围。早先这里直接 return，
+      // 游标不前进、退避计数归零，runChunk 会以每秒几十次的速率空转打远端。
+      if (response.status === 416 && pieceEnd >= 0) {
+        await response.body?.cancel().catch(() => {})
+        const error = new Error('HTTP 416：远端拒绝了该字节范围（文件可能已变化，或被防盗链/CDN 拦截）')
+        error.code = 'RANGE_UNSATISFIABLE'
+        throw error
+      }
+      if (!response.ok) throw httpErrorFor(response.status, response)
+      if (pieceEnd >= 0 && response.status === 200) {
+        await response.body?.cancel().catch(() => {})
+        if (ifRange !== '') {
+          this.superseded = true
+          this.fingerprintState = 'changed'
+          this.fingerprintNote = '下载过程中远端文件已变化，已自动从头重新下载'
+          const changed = new Error('远端文件已变化（If-Range 不匹配）')
+          changed.code = 'FINGERPRINT_CHANGED'
+          throw changed
+        }
+        const ignored = new Error('服务器忽略了 Range 请求')
+        ignored.code = 'RANGE_IGNORED'
+        throw ignored
+      }
+      if (pieceEnd >= 0 && response.status !== 206) throw new Error(`HTTP ${response.status}`)
+      if (response.body === null) throw new Error('响应没有正文')
+      const reader = response.body.getReader()
+      let cursor = position
+      for (;;) {
+        let step
+        try {
+          step = await this.readBody(reader)
+        } catch (error) {
+          // 空闲超时/读流报错：主动取消正文，别把半死连接留在连接池里。
+          await reader.cancel().catch(() => {})
+          throw error
+        }
+        const { done, value } = step
+        if (done) break
+        if (this.runToken !== run || this.status !== 'downloading' || this.superseded) {
+          await reader.cancel().catch(() => {})
+          return
+        }
+        if (this.handle === null) throw new Error('文件句柄已关闭')
+        // 站点聚合限速（风控后按站点生效）+ 全局限速，两者都要过。
+        if (site !== null) await site.limiter.take(value.length)
+        await this.manager.limiter.take(value.length)
+        await this.handle.write(value, 0, value.length, cursor)
+        cursor += value.length
+        chunk.cursor = cursor - chunk.start
+        this.receivedBytes += value.length
+      }
+      if (this.runToken !== run || this.status !== 'downloading') return
+      // 单连接整段下载或已读满本段：正常结束；有进展但没读满则回到循环继续要剩余部分。
+      if (pieceEnd < 0 || cursor > pieceEnd || cursor > position) return
+      throw new Error('连接提前结束')
+    } finally {
+      if (release !== null) release()
+    }
+  }
+
+  /**
+   * 带空闲超时地读一段正文。
+   *
+   * 服务端可能回了 206 头和几个字节就停住；没有超时的话这个分片会永远停在
+   * reader.read() 上：速度归零、不触发重试、而且一直占着全局连接槽。
+   */
+  async readBody(reader) {
+    const idle = this.manager.ioIdleTimeoutMs ?? BODY_IDLE_TIMEOUT_MS
+    if (!(idle > 0)) return reader.read()
+    let timer = null
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error(`分片正文超时（${Math.round(idle / 1000)} 秒没有收到数据），正在重试`)
+        error.name = 'AbortError'
+        error.code = 'BODY_IDLE_TIMEOUT'
+        reject(error)
+      }, idle)
+      timer.unref?.()
+    })
+    try {
+      return await Promise.race([reader.read(), timeout])
+    } finally {
+      if (timer !== null) clearTimeout(timer)
     }
   }
 
@@ -1180,13 +755,28 @@ class DownloadTask {
     await this.runChunks()
   }
 
+  /**
+   * 一轮下载。用令牌标记本轮：pause 后立刻 resume 会开新一轮，旧轮的循环与收尾
+   * 发现令牌被换掉就安静退出，不会去 finalize/fail 别人的句柄与状态。
+   */
   async runChunks() {
+    const run = Symbol('run')
+    this.runToken = run
+    try {
+      await this.runChunksBody(run)
+    } catch (error) {
+      if (this.runToken !== run) return
+      this.fail(error)
+    }
+  }
+
+  async runChunksBody(run) {
     this.abort = new AbortController()
     this.superseded = false
     this.status = 'downloading'
     // 续传前核对旁证 / 大小 / ETag / Last-Modified，变化则从头下载，避免拼出混合内容。
     if (this.chunks.some((chunk) => chunk.cursor > 0)) await this.revalidate()
-    if (this.status !== 'downloading') return
+    if (this.runToken !== run || this.status !== 'downloading') return
     if (this.handle === null) this.handle = await open(this.partPath, 'r+')
     if (this.resetFile) {
       const truncateTo = this.chunks.length === 1 && this.chunks[0].end < 0 ? 0 : this.totalBytes
@@ -1205,11 +795,19 @@ class DownloadTask {
     // 续传起点补一个采样，曲线在暂停区间保持水平而不是斜线。
     this.recordHistory(Date.now())
     this.startSampler()
-    const settled = await Promise.allSettled(this.chunks.map((chunk) => this.runChunk(chunk)))
+    const settled = await Promise.allSettled(this.chunks.map((chunk) => this.runChunk(chunk, run)))
+    // 本轮已被 pause/resume 或重启换掉：旧轮的收尾必须放弃，否则会误判新一轮。
+    if (this.runToken !== run) return
     if (this.status !== 'downloading') return
     const failed = settled.find((entry) => entry.status === 'rejected')
     if (failed !== undefined) {
       if (failed.reason?.code === 'FINGERPRINT_CHANGED' && !this.freshRestart) {
+        await this.restartFresh()
+        return
+      }
+      // 416：远端否认这些字节范围。只重建一次分片，再失败就明确报错。
+      if (failed.reason?.code === 'RANGE_UNSATISFIABLE' && !this.rangeRebuild) {
+        this.rangeRebuild = true
         await this.restartFresh()
         return
       }
@@ -1296,7 +894,16 @@ class DownloadTask {
   }
 
   pause() {
+    // 排队中的任务直接从队列里停下，否则「暂停成功」之后它照样会开始下载。
+    if (this.status === 'queued') {
+      this.status = 'paused'
+      this.manager.persistTasks()
+      this.manager.pump()
+      return
+    }
     if (!this.active) return
+    // 作废本轮令牌：旧的分片循环与收尾看到令牌变了就退出，不会再碰句柄。
+    this.runToken = null
     this.status = 'paused'
     this.recordHistory(Date.now())
     this.stopSampler()
@@ -1377,7 +984,17 @@ class Downloader {
   constructor(options) {
     this.root = options.directory
     this.defaultThreads = options.threads
-    this.maxConcurrent = options.maxConcurrent
+    this.maxConnections = clampConnections(options.maxConnections)
+    this.slots = new ConnectionSlots(this.maxConnections)
+    this.maxConcurrent = Math.max(1, Math.min(MAX_ACTIVE_TASKS, this.maxConnections))
+    /** 设备负载自适应：高负载时把实际连接预算压低，Agent 也绕不过。 */
+    this.loadAdaptive = options.loadAdaptive !== false
+    this.loadGovernor = new LoadGovernor(this.maxConnections, this.loadAdaptive)
+    this.resourceSampler = new ResourceSampler((sample) => this.applyResourceSample(sample))
+    if (this.loadAdaptive) this.resourceSampler.start()
+    /** 站点风控自适应：每个站点一套独立并发与限速。 */
+    this.siteAdaptive = options.siteAdaptive !== false
+    this.siteGovernor = new SiteGovernor(this.siteAdaptive)
     this.largeFileBytes = options.largeFileMb * 1024 * 1024
     this.largeFileMb = Math.round(this.largeFileBytes / (1024 * 1024))
     this.minThreadMb = options.minThreadMb
@@ -1391,6 +1008,8 @@ class Downloader {
     this.silentEnabled = options.silentEnabled
     this.rateLimitBytes = options.rateLimitBytes ?? 0
     this.limiter = new RateLimiter(this.rateLimitBytes)
+    /** 分片正文空闲超时（毫秒）；测试可传小值，生产用默认 30 秒。 */
+    this.ioIdleTimeoutMs = Number(options.ioIdleTimeoutMs) > 0 ? Number(options.ioIdleTimeoutMs) : BODY_IDLE_TIMEOUT_MS
     this.dohEnabled = options.dohEnabled === true
     this.dohProvider = normalizeDohProvider(options.dohProvider)
     this.githubEnabled = options.githubEnabled === true
@@ -1436,6 +1055,52 @@ class Downloader {
     return count
   }
 
+  /** 当前实际生效的连接预算（设备高负载时低于用户设定值）。 */
+  get effectiveConnections() {
+    return this.slots.limit
+  }
+
+  /** 采样回调：压力高立即收缩，压力低逐步恢复；预算变化同步任务数上限。 */
+  applyResourceSample(sample) {
+    this.lastResources = sample
+    const limit = this.loadGovernor.observe(sample.cpuPct, sample.memoryPct)
+    this.applyConnectionBudget(limit)
+  }
+
+  applyConnectionBudget(limit) {
+    const next = Math.max(1, Math.round(limit) || 1)
+    if (this.slots.limit !== next) this.slots.setLimit(next)
+    this.maxConcurrent = Math.max(1, Math.min(MAX_ACTIVE_TASKS, next))
+    this.pump()
+  }
+
+  setLoadAdaptive(enabled) {
+    this.loadAdaptive = enabled !== false
+    const limit = this.loadGovernor.setEnabled(this.loadAdaptive)
+    if (this.loadAdaptive) this.resourceSampler.start()
+    else this.resourceSampler.stop()
+    this.applyConnectionBudget(limit)
+  }
+
+  setSiteAdaptive(enabled) {
+    this.siteAdaptive = enabled !== false
+    this.siteGovernor.setEnabled(this.siteAdaptive)
+  }
+
+  resourceState() {
+    const governor = this.loadGovernor
+    return {
+      enabled: this.loadAdaptive,
+      cpuPct: governor.cpuPct === null ? null : Math.round(governor.cpuPct),
+      memoryPct: governor.memoryPct === null ? null : Math.round(governor.memoryPct),
+      pressure: governor.pressure === null ? null : Math.round(governor.pressure),
+      level: governor.level,
+      baseConnections: governor.base,
+      effectiveConnections: governor.limit,
+      sampledAt: governor.lastSampleAt,
+    }
+  }
+
   /** 未结束的任务数：排队/解析/下载/暂停；不含完成、取消与失败。 */
   unfinishedCount() {
     let count = 0
@@ -1454,11 +1119,13 @@ class Downloader {
     let totalBytes = 0
     let receivedBytes = 0
     let speed = 0
+    let downloadingRemaining = 0
     let top = null
     const tasks = []
     for (const task of this.tasks.values()) {
       if (task.status !== 'queued' && task.status !== 'probing' && task.status !== 'downloading' && task.status !== 'paused') continue
       if (!this.shouldDisplay(task)) continue
+      const remainingBytes = task.totalBytes > 0 ? Math.max(0, task.totalBytes - task.receivedBytes) : 0
       const entry = {
         id: task.id,
         filename: task.filename,
@@ -1468,15 +1135,23 @@ class Downloader {
         speed: task.speed,
         totalBytes: task.totalBytes,
         receivedBytes: task.receivedBytes,
+        remainingBytes,
+        ...(task.status === 'downloading' && task.speed > 0 && remainingBytes > 0
+          ? { etaSeconds: Math.max(1, Math.round(remainingBytes / task.speed)) }
+          : {}),
       }
       tasks.push(entry)
       unfinished += 1
       totalBytes += task.totalBytes
       receivedBytes += task.receivedBytes
-      if (task.status === 'downloading') speed += task.speed
+      if (task.status === 'downloading') {
+        speed += task.speed
+        downloadingRemaining += remainingBytes
+      }
       if (top === null || (top.status !== 'downloading' && task.status === 'downloading')) top = entry
     }
-    return { unfinished, active: this.activeCount(), totalBytes, receivedBytes, speed, top, tasks, largeFileBytes: this.largeFileBytes, largeFileMb: this.largeFileMb, minThreadBytes: this.minThreadBytes, minThreadMb: this.minThreadMb, minThreadEnabled: this.minThreadEnabled, agentAutonomy: this.agentAutonomy, autoThreads: this.autoThreads, fingerprintResume: this.fingerprintResume, silentEnabled: this.silentEnabled }
+    const etaSeconds = speed > 0 && downloadingRemaining > 0 ? Math.max(1, Math.round(downloadingRemaining / speed)) : null
+    return { unfinished, active: this.activeCount(), activeConnections: this.slots.used, maxConnections: this.maxConnections, effectiveConnections: this.effectiveConnections, loadLevel: this.loadGovernor.level, siteThrottles: this.siteGovernor.snapshot().length, totalBytes, receivedBytes, speed, ...(etaSeconds === null ? {} : { etaSeconds }), top, tasks, largeFileBytes: this.largeFileBytes, largeFileMb: this.largeFileMb, minThreadBytes: this.minThreadBytes, minThreadMb: this.minThreadMb, minThreadEnabled: this.minThreadEnabled, agentAutonomy: this.agentAutonomy, autoThreads: this.autoThreads, fingerprintResume: this.fingerprintResume, silentEnabled: this.silentEnabled }
   }
 
   /** 一次校验并应用两个阈值，避免部分成功。 */
@@ -1512,12 +1187,17 @@ class Downloader {
       this.rateLimitBytes = rate
       this.limiter.setRate(rate)
     }
-    if (input.maxConcurrent !== undefined) {
-      const concurrency = Math.round(Number(input.maxConcurrent))
-      if (!Number.isFinite(concurrency) || concurrency < 1 || concurrency > 8) throw new Error('同时任务数需为 1..8')
-      this.maxConcurrent = concurrency
-      this.pump()
+    if (input.maxConnections !== undefined) {
+      const concurrency = Math.round(Number(input.maxConnections))
+      if (!Number.isFinite(concurrency) || concurrency < 1 || concurrency > MAX_CONNECTIONS) {
+        throw new Error(`并发限制数需为 1..${MAX_CONNECTIONS}`)
+      }
+      this.maxConnections = concurrency
+      // 用户设定的是上限；实际预算仍由设备负载决定。
+      this.applyConnectionBudget(this.loadGovernor.setBase(concurrency))
     }
+    if (input.loadAdaptive !== undefined) this.setLoadAdaptive(Boolean(input.loadAdaptive))
+    if (input.siteAdaptive !== undefined) this.setSiteAdaptive(Boolean(input.siteAdaptive))
     if (input.dohEnabled !== undefined || input.dohProvider !== undefined) {
       this.setDoh(
         input.dohEnabled !== undefined ? Boolean(input.dohEnabled) : this.dohEnabled,
@@ -1537,7 +1217,10 @@ class Downloader {
       fingerprintResume: this.fingerprintResume,
       silentEnabled: this.silentEnabled,
       rateLimitBytes: this.rateLimitBytes,
-      maxConcurrent: this.maxConcurrent,
+      maxConnections: this.maxConnections,
+      loadAdaptive: this.loadAdaptive,
+      siteAdaptive: this.siteAdaptive,
+      effectiveConnections: this.effectiveConnections,
       dohEnabled: this.dohEnabled,
       dohProvider: this.dohProvider,
       githubEnabled: this.githubEnabled,
@@ -1551,7 +1234,7 @@ class Downloader {
     if (typeof this.settingsPath !== 'string' || this.settingsPath === '') return false
     try {
       const payload = JSON.stringify({
-        version: 10,
+        version: SETTINGS_SCHEMA_VERSION,
         largeFileBytes: this.largeFileBytes,
         minThreadBytes: this.minThreadBytes,
         minThreadEnabled: this.minThreadEnabled,
@@ -1560,7 +1243,9 @@ class Downloader {
         fingerprintResume: this.fingerprintResume,
         silentEnabled: this.silentEnabled,
         rateLimitBytes: this.rateLimitBytes,
-        maxConcurrent: this.maxConcurrent,
+        maxConnections: this.maxConnections,
+        loadAdaptive: this.loadAdaptive,
+        siteAdaptive: this.siteAdaptive,
         dohEnabled: this.dohEnabled,
         dohProvider: this.dohProvider,
         githubEnabled: this.githubEnabled,
@@ -1626,6 +1311,10 @@ class Downloader {
           singleThread: record.singleThread,
           origin: record.origin,
           headers: record.headers ?? {},
+          doh: record.doh === true,
+          dohProvider: record.dohProvider ?? this.dohProvider,
+          github: record.github === true,
+          forceDisplay: record.forceDisplay === true,
           checksum: record.checksum ?? (typeof record.sha256 === 'string' && record.sha256 !== '' ? { algorithm: 'sha256', value: record.sha256 } : null),
         })
         task.requestedName = typeof record.requestedName === 'string' ? record.requestedName : ''
@@ -1732,9 +1421,16 @@ class Downloader {
     const task = this.get(id)
     switch (action) {
       case 'pause':
+        // 已结束或已暂停：状态不变，仍然返回当前任务，便于 Agent 确认。
+        if (task.status === 'completed' || task.status === 'canceled' || task.status === 'paused') {
+          return { task: task.snapshot() }
+        }
         task.pause()
         return { task: task.snapshot() }
       case 'resume':
+        if (task.status === 'canceled') throw new Error('任务已取消，无法恢复；请重新新建下载')
+        if (task.status === 'completed') throw new Error('任务已完成，无需恢复')
+        if (task.status === 'queued' || task.active) return { task: task.snapshot() }
         task.resume()
         this.pump()
         return { task: task.snapshot() }
@@ -1754,6 +1450,8 @@ class Downloader {
     let removed = 0
     for (const task of [...this.tasks.values()]) {
       if (!finished.includes(task.status)) continue
+      // 释放文件名占位，否则同名文件下次下载会被迫改名为 "xxx (1).bin"。
+      if (task.path !== '') this.releaseName(task.path)
       this.tasks.delete(task.id)
       removed += 1
     }
@@ -1764,8 +1462,12 @@ class Downloader {
   dispose() {
     this.persistTasks()
     if (this.persistTimer !== null) clearInterval(this.persistTimer)
+    this.resourceSampler.stop()
     for (const task of this.tasks.values()) task.dispose()
     this.tasks.clear()
+    // DoH 的 undici Agent 持有 keep-alive 连接池，插件重载前必须关掉。
+    for (const agent of this.dohAgents.values()) agent.close?.()
+    this.dohAgents.clear()
   }
 }
 
@@ -1855,12 +1557,21 @@ const TOOL_PARAMETERS = {
       required: ['algorithm', 'value'],
       description: '完成后校验文件；支持 md5/sha1/sha256/sha512/crc32。',
     },
-    id: { type: 'string', description: 'pause/resume/cancel/remove 时的任务 id。' },
+    id: { type: 'string', description: 'pause/resume/cancel/remove 时的任务 id；list 时只返回该任务。' },
     directory: { type: 'string', description: '保存目录，省略则用插件默认目录。' },
     filename: { type: 'string', description: '保存文件名，省略则由响应头或 URL 推断。' },
-    threads: { type: 'integer', description: '分片并发数 1..16，省略用默认值。' },
+    doh: { type: 'boolean', description: 'add 时让该任务用 DoH 解析域名（本机 DNS 可能被污染时用）；省略则跟随插件设置。' },
+    dohProvider: {
+      type: 'string',
+      enum: ['cloudflare', 'alidns', 'tencent'],
+      description: 'add 时的 DoH 提供商；省略则跟随插件设置（默认阿里 DoH）。',
+    },
+    github: { type: 'boolean', description: 'add 时把 GitHub Release 直链换成 API 资产链接（受未认证 API 60 次/小时限制）；省略则跟随插件设置，失败会回退直链。' },
+    forceDisplay: { type: 'boolean', description: 'add 时强制在面板和对话显示该任务，即使小于静默阈值。' },
+    threads: { type: 'integer', description: '分片并发数 1..16；所有任务共享并发限制数（默认 16，= 任务数 × 线程数），超出部分排队，Agent 无法绕过该上限。' },
     singleThread: { type: 'boolean', description: 'true 强制单连接，false 强制分片；省略时普通模式按单线程阈值，Agent 自主模式下默认分片。' },
     limit: { type: 'integer', description: 'list 时最多返回多少条（1..100，默认 20）。' },
+    waitSeconds: { type: 'integer', minimum: 0, maximum: 300, description: 'list 时最多等多少秒：期间每秒检查一次，任务全部结束或超时后返回，避免反复轮询。默认 0（立即返回）。' },
   },
   required: ['action'],
 }
@@ -1878,8 +1589,10 @@ const TASK_SCHEMA = {
     error: { type: 'string' },
     totalBytes: { type: 'integer' },
     receivedBytes: { type: 'integer' },
+    remainingBytes: { type: 'integer' },
     progress: { type: 'number' },
     speed: { type: 'integer' },
+    etaSeconds: { type: 'integer' },
     threads: { type: 'integer' },
     createdAt: { type: 'integer' },
     startedAt: { type: 'integer' },
@@ -1906,6 +1619,19 @@ const TASK_SCHEMA = {
         note: { type: 'string' },
       },
     },
+    siteKey: { type: 'string' },
+    siteThrottle: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        level: { type: 'integer' },
+        connections: { type: 'integer' },
+        rateBytes: { type: 'integer' },
+        cooldownUntil: { type: 'integer' },
+      },
+    },
+    riskRetries: { type: 'integer' },
+    riskNote: { type: 'string' },
   },
 }
 
@@ -1913,7 +1639,7 @@ function makeTool(manager) {
   return {
     name: 'downloader',
     description:
-      '多线程（HTTP Range 分片）文件下载器，下载到 dsh Host 本机磁盘。action=add 需要 url，可选 directory/filename/threads；action=list 返回任务与进度（limit 默认 20，visibleInUi 表示是否在面板显示）；用返回的 id 执行 pause/resume/cancel/remove；clean 清空已结束任务。下载在 Host 后台继续，不需要等待；达到静默阈值（或开关关闭）的任务额外返回 history；小于阈值且开关开启时任务静默完成，不出现在面板和对话条，但工具 list 仍可见。可用 singleThread 指定单连接/分片；可选 doh=true 走 DoH 解析、github=true 把 GitHub Release 直链换成 API 资产链接；用户手动下载始终显示并多线程；其余下载由 Agent 控制或受阈值约束。',
+      '多线程（HTTP Range 分片）文件下载器，下载到 dsh Host 本机磁盘。action=add 需要 url，可选 directory/filename/threads；action=list 返回任务与进度（limit 默认 20，visibleInUi 表示是否在面板显示），任务带 remainingBytes 与 etaSeconds（预估剩余秒数）；用返回的 id 执行 pause/resume/cancel/remove；clean 清空已结束任务。下载在 Host 后台继续，不需要等待——不要反复 list 轮询；要等完成时用 list 的 waitSeconds（0..300，任务结束或超时后返回一次）或只查单个 id。小于静默阈值且开关开启时任务静默完成，不出现在面板和对话条，但工具 list 仍可见；需要强制显示时传 forceDisplay=true。可用 singleThread 指定单连接/分片；可选 doh=true 走 DoH 解析、github=true 把 GitHub Release 直链换成 API 资产链接；用户手动下载始终显示并多线程；其余下载由 Agent 控制或受阈值约束。并发上限 = 并发任务数 × 单任务线程数，全局连接数由用户设置（默认 16，范围 1..64），Agent 指定的 threads 同样受此约束。设备高负载时实际并发会被自动压低；同一站点的并发与聚合限速由站点风控策略单独控制（403/429/503 后自动降档），这两项都在用户设置里，Agent 无法关闭。',
     parameters: TOOL_PARAMETERS,
     output: {
       schema: {
@@ -1925,6 +1651,8 @@ function makeTool(manager) {
           task: TASK_SCHEMA,
           tasks: { type: 'array', items: TASK_SCHEMA },
           total: { type: 'integer' },
+          waitedSeconds: { type: 'integer' },
+          timedOut: { type: 'boolean' },
           removed: { type: 'string' },
           cleaned: { type: 'integer' },
           directory: { type: 'string' },
@@ -1935,13 +1663,16 @@ function makeTool(manager) {
           silentEnabled: { type: 'boolean' },
           largeFileMb: { type: 'integer' },
           minThreadMb: { type: 'integer' },
+          maxConnections: { type: 'integer' },
+          activeConnections: { type: 'integer' },
           error: { type: 'string' },
         },
       },
       render: (_args, value) => toolText(JSON.stringify(value, null, 2)),
     },
-    async execute(args) {
+    async execute(args, exec) {
       const input = args ?? {}
+      const signal = exec?.signal
       try {
         switch (input.action) {
           case 'add': {
@@ -1973,12 +1704,33 @@ function makeTool(manager) {
           }
           case 'list': {
             const limit = Math.min(100, Math.max(1, Math.round(Number(input.limit)) || 20))
-            const all = manager.list()
+            const onlyId = typeof input.id === 'string' && input.id !== '' ? input.id : ''
+            const waitSeconds = Math.min(300, Math.max(0, Math.round(Number(input.waitSeconds)) || 0))
+            // 有 waitSeconds 时在这一次调用里等任务结束，Agent 不需要反复轮询 list。
+            const startedAt = Date.now()
+            let timedOut = false
+            if (waitSeconds > 0) {
+              const deadline = startedAt + waitSeconds * 1000
+              const stillRunning = () => [...manager.tasks.values()].some((task) => (
+                (onlyId === '' || task.id === onlyId)
+                && (task.status === 'queued' || task.status === 'probing' || task.status === 'downloading')
+              ))
+              while (Date.now() < deadline && stillRunning()) {
+                // 用户取消本轮时立刻返回，不要继续阻塞最多 300 秒。
+                if (signal?.aborted === true) break
+                await new Promise((done) => setTimeout(done, Math.min(1000, Math.max(50, deadline - Date.now()))))
+              }
+              timedOut = !(signal?.aborted === true) && stillRunning()
+            }
+            const all = (onlyId === '' ? manager.list() : manager.list().filter((task) => task.id === onlyId))
+            if (onlyId !== '' && all.length === 0) throw new Error(`下载任务不存在：${onlyId}`)
             return {
               ok: true,
               action: 'list',
               tasks: all.slice(0, limit).map((task) => ({ ...task, visibleInUi: manager.shouldDisplay(task) })),
               total: all.length,
+              waitedSeconds: Math.round((Date.now() - startedAt) / 1000),
+              timedOut,
               directory: manager.root,
               defaultThreads: manager.defaultThreads,
               agentAutonomy: manager.agentAutonomy,
@@ -1987,6 +1739,8 @@ function makeTool(manager) {
               silentEnabled: manager.silentEnabled,
               largeFileMb: manager.largeFileMb,
               minThreadMb: manager.minThreadMb,
+              maxConnections: manager.maxConnections,
+              activeConnections: manager.slots.used,
             }
           }
           case 'clean':
@@ -2004,6 +1758,199 @@ function makeTool(manager) {
         }
       } catch (error) {
         return { ok: false, action: String(input.action ?? ''), error: error instanceof Error ? error.message : String(error) }
+      }
+    },
+  }
+}
+
+/** doh_lookup 工具：批量上限，避免一次解析把 Host 打满。 */
+const DOH_LOOKUP_LIMIT = 20
+
+const DOH_TOOL_PARAMETERS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    name: { type: 'string', description: '要解析的域名；批量用 names。传 IP 时原样返回。' },
+    names: { type: 'array', items: { type: 'string' }, description: '批量域名/主机名（最多 20 个），与 name 二选一。' },
+    type: {
+      type: 'string',
+      enum: ['A', 'AAAA', 'both', 'CNAME', 'TXT', 'MX', 'NS', 'SOA', 'PTR', 'SRV', 'CAA', 'HTTPS'],
+      description: '记录类型，默认 A；both 表示同时查 A 与 AAAA（最常用于拿真实 IP）。',
+    },
+    provider: {
+      type: 'string',
+      enum: ['cloudflare', 'alidns', 'tencent'],
+      description: 'DoH 提供商，默认用插件设置里的提供商（AliDNS）。',
+    },
+    fresh: { type: 'boolean', description: 'true 跳过 60 秒结果缓存，强制重新查询。' },
+  },
+}
+
+/** 把记录数据压成字符串，保证工具输出 schema 稳定（HTTPS/SOA 是对象）。 */
+function flattenDnsAnswer(record) {
+  const data = record.data
+  return {
+    type: record.type,
+    ttl: record.ttl,
+    data: typeof data === 'string' ? data : JSON.stringify(data),
+  }
+}
+
+function makeDohTool(manager) {
+  return {
+    name: 'doh_lookup',
+    description:
+      '用 DNS over HTTPS 解析域名，不依赖本机 DNS：本机解析被污染或劫持时，先用它拿到真实 IP，再配合 curl --resolve / 请求头直连。name 必填（批量用 names，最多 20 个）；type 默认 A，both = A+AAAA，也支持 CNAME/TXT/MX/NS/SOA/PTR/SRV/CAA/HTTPS；provider 可选 cloudflare/alidns/tencent，默认用插件设置；fresh=true 跳过 60 秒缓存。返回每条记录的类型、TTL、数据，以及 A/AAAA 地址列表。只做解析，不下载、不访问目标站点。',
+    parameters: DOH_TOOL_PARAMETERS,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          provider: { type: 'string' },
+          results: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                name: { type: 'string' },
+                type: { type: 'string' },
+                status: { type: 'integer' },
+                cached: { type: 'boolean' },
+                ms: { type: 'integer' },
+                records: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      type: { type: 'string' },
+                      ttl: { type: 'integer' },
+                      data: { type: 'string' },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          addresses: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                name: { type: 'string' },
+                address: { type: 'string' },
+                family: { type: 'integer' },
+              },
+            },
+          },
+          error: { type: 'string' },
+        },
+      },
+      render: (_args, value) => toolText(JSON.stringify(value, null, 2)),
+    },
+    async execute(args) {
+      const input = args ?? {}
+      try {
+        const provider = normalizeDohProvider(input.provider ?? manager.dohProvider)
+        const resolver = resolverFor(provider)
+        const hosts = (Array.isArray(input.names) && input.names.length > 0 ? input.names : [input.name])
+          .map((entry) => String(entry ?? '').trim())
+          .filter((entry) => entry !== '')
+        if (hosts.length === 0) throw new Error('缺少 name')
+        if (hosts.length > DOH_LOOKUP_LIMIT) throw new Error(`一次最多解析 ${DOH_LOOKUP_LIMIT} 个域名`)
+        const type = input.type === 'both' ? 'both' : String(input.type ?? 'A')
+        const types = type === 'both' ? ['A', 'AAAA'] : [type]
+        const results = []
+        const addresses = []
+        for (const host of hosts) {
+          const family = ipFamilyOf(host)
+          if (family !== 0 && types.every((single) => single === 'A' || single === 'AAAA')) {
+            // 传的就是 IP：不必查 DNS，直接原样返回，避免 DoH 白跑一趟。
+            const recordType = family === 4 ? 'A' : 'AAAA'
+            results.push({ name: host, type: recordType, status: 0, cached: false, ms: 0, records: [{ type: recordType, ttl: 0, data: host }] })
+            addresses.push({ name: host, address: host, family })
+            continue
+          }
+          for (const single of types) {
+            const answer = await resolver.query(host, single, { fresh: input.fresh === true })
+            results.push({ ...answer, records: answer.records.map(flattenDnsAnswer) })
+            for (const record of answer.records) {
+              if (record.type === 'A') addresses.push({ name: host, address: record.data, family: 4 })
+              if (record.type === 'AAAA') addresses.push({ name: host, address: record.data, family: 6 })
+            }
+          }
+        }
+        if (addresses.length === 0 && types.some((single) => single === 'A' || single === 'AAAA')) {
+          throw new Error(`DoH 没有解析结果：${hosts.join(', ')}（${provider}）`)
+        }
+        return { ok: true, provider, results, addresses }
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) }
+      }
+    },
+  }
+}
+
+const PROBE_TOOL_PARAMETERS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    url: { type: 'string', description: '要探测的 http/https 地址。' },
+    headers: {
+      type: 'object',
+      additionalProperties: { type: 'string' },
+      description: '可选请求头（Cookie / Referer / Authorization 等）；Range 等下载器控制的头会被忽略。',
+    },
+    doh: { type: 'boolean', description: 'true 表示用 DoH 解析该地址的域名，适合本机 DNS 被污染时。' },
+    dohProvider: { type: 'string', enum: ['cloudflare', 'alidns', 'tencent'], description: 'doh=true 时的提供商，默认用插件设置。' },
+  },
+  required: ['url'],
+}
+
+function makeProbeTool(manager) {
+  return {
+    name: 'http_probe',
+    description:
+      '探测一个 http/https 地址的响应头，不下载正文（只发 HEAD，必要时补一个 bytes=0-0 的 Range 请求）。返回文件大小、是否支持 Range（能否分片/续传）、Content-Disposition 文件名、ETag 与 Last-Modified，并在 401/403 时说明需要 headers 提供 Cookie / Referer / Authorization。可选 headers 与 doh=true（DoH 解析）。下载前用它确认可分片、断点续传可信度，或诊断 403/防盗链。',
+    parameters: PROBE_TOOL_PARAMETERS,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          url: { type: 'string' },
+          size: { type: 'integer' },
+          ranges: { type: 'boolean' },
+          filename: { type: 'string' },
+          etag: { type: 'string' },
+          lastModified: { type: 'string' },
+          error: { type: 'string' },
+        },
+      },
+      render: (_args, value) => toolText(JSON.stringify(value, null, 2)),
+    },
+    async execute(args) {
+      const input = args ?? {}
+      try {
+        const url = String(input.url ?? '').trim()
+        if (url === '') throw new Error('缺少 url')
+        const dispatcher = input.doh === true
+          ? createDohDispatcher(input.dohProvider ?? manager.dohProvider)
+          : undefined
+        try {
+          const result = await probe(url, AbortSignal.timeout(60_000), sanitizeHeaders(input.headers), dispatcher)
+          return { ok: true, url, ...result }
+        } finally {
+          // DoH 解析用的 Agent 是一次性的，不关会一直占着连接。
+          dispatcher?.close?.()
+        }
+      } catch (error) {
+        return { ok: false, url: String(input.url ?? ''), error: error instanceof Error ? error.message : String(error) }
       }
     },
   }
@@ -2035,7 +1982,14 @@ function makeRoutes(manager) {
           tasks: manager.list(true).filter((task) => manager.shouldDisplay(task)),
           directory: manager.root,
           defaultThreads: manager.defaultThreads,
+          maxConnections: manager.maxConnections,
+          activeConnections: manager.slots.used,
+          effectiveConnections: manager.effectiveConnections,
           maxConcurrent: manager.maxConcurrent,
+          loadAdaptive: manager.loadAdaptive,
+          siteAdaptive: manager.siteAdaptive,
+          resources: manager.resourceState(),
+          sites: manager.siteGovernor.snapshot(),
           active: manager.activeCount(),
           largeFileBytes: manager.largeFileBytes,
           largeFileMb: manager.largeFileMb,
@@ -2133,7 +2087,8 @@ function makeRoutes(manager) {
           const picked = await pickNativeDirectory(title, initial)
           writeJson(response, 200, { ok: true, native: true, path: picked ?? null })
         } catch (error) {
-          writeJson(response, 200, { ok: true, native: false, path: null, error: error instanceof Error ? error.message : String(error) })
+          // 选择器本身失败要如实报告，不能伪装成「用户取消」。
+          writeJson(response, 200, { ok: false, native: false, path: null, error: error instanceof Error ? error.message : String(error) })
         }
       },
     },
@@ -2173,7 +2128,7 @@ export const inject = ['tools', 'webServer']
 
 /** 每次模型请求注入的简短公告；工具被 restrict 隐藏时自动消失。 */
 const TOOL_GUIDANCE =
-  '多线程下载器：需要把 http/https 文件下载到这台机器时，使用 downloader 工具（action=add 新建，list 查看进度，pause/resume 断点续传，cancel/remove 清理）。下载在 Host 后台进行，不必等待完成；支持自定义请求头（Cookie/Referer/Authorization）、镜像回退、批量 URL、多算法校验、分片重试与全局限速；可选 DoH 解析与 GitHub 资产解析；小于静默阈值（默认 16 MB，可关闭，关闭后显示全部任务）的文件静默下载，不在面板和对话中显示；达到阈值的任务显示进度曲线；小于单线程阈值（默认 4 MB）的文件单连接下载，更大文件按大小自动 4/6/8 条连接（可显式指定 threads）。续传前与收尾都会用 ETag/Last-Modified 指纹复核，分片请求带 If-Range，远端换版本会自动从头重下。用户手动下载（面板填 URL/目录/线程）始终显示并多线程；其余下载视为 Agent 任务，受静默/单线程阈值约束，Agent 自主模式下可由 Agent 指定线程策略。完整用法见 skill multithread-downloader。'
+  '多线程下载器：需要把 http/https 文件下载到这台机器时，使用 downloader 工具（action=add 新建，list 查看进度，pause/resume 断点续传，cancel/remove 清理）。下载在 Host 后台进行，不必等待完成——不要反复调用 list 轮询；确实要等结果时用 list 的 waitSeconds（最多 300 秒，任务结束或超时后返回一次），或在需要时看一次任务上的 etaSeconds 预估剩余秒数。支持自定义请求头（Cookie/Referer/Authorization）、镜像回退、批量 URL、多算法校验、分片重试与全局限速；可选 DoH 解析与 GitHub 资产解析；小于静默阈值（默认 16 MB，可关闭，关闭后显示全部任务）的文件静默下载，不在面板和对话中显示；达到阈值的任务显示进度曲线；小于单线程阈值（默认 4 MB）的文件单连接下载，更大文件按大小自动 4/6/8 条连接（可显式指定 threads）。续传前与收尾都会用 ETag/Last-Modified 指纹复核，分片请求带 If-Range，远端换版本会自动从头重下。并发上限 = 并发任务数 × 单任务线程数，全局连接数由用户设置（默认 16，范围 1..64），Agent 指定的线程数同样受此约束、无法绕过；Host 还会按设备 CPU/内存负载自动收缩并发，并对触发风控的站点按站点降并发、加聚合限速（不同站点互不影响）。用户手动下载（面板填 URL/目录/线程）始终显示并多线程；其余下载视为 Agent 任务，受静默/单线程阈值约束，Agent 自主模式下可由 Agent 指定线程策略。本机 DNS 被污染或怀疑解析异常时，用同插件提供的 doh_lookup 直接走 DoH 解析（name 必填，type=both 同时取 A/AAAA，provider 可选）；下载前想确认大小、是否支持 Range、ETag 与 403 原因时用 http_probe（只发 HEAD/1 字节 Range，不下载正文）。这两个工具与 downloader 任务独立，不占连接配额。完整用法见 skill multithread-downloader。'
 
 /** 注册给所有会话的技能正文（按需加载，不占常驻提示）。 */
 const SKILL_CONTENT = `# 多线程下载器（downloader）
@@ -2193,7 +2148,7 @@ const SKILL_CONTENT = `# 多线程下载器（downloader）
 - \`url\` 必填，只支持 http/https。
 - \`directory\` 可选，Host 本机绝对路径；省略则用插件默认目录（Known Folder / 用户 Downloads）。面板里点“选择…”：Electron 桌面环境使用系统原生目录对话框（标题“选择下载目录”）；其他环境使用插件内目录浏览器（同样标题，支持面包屑与选择当前目录）。
 - \`filename\` 可选，只写文件名，不要带路径分隔符。
-- \`threads\` 可选，1..16；省略时按大小自动（<32 MB 4 条、<256 MB 6 条、更大 8 条，可被 autoThreads 关闭），显式给出则固定；服务器不支持 Range 时自动回退单连接。
+- \`threads\` 可选，1..16；省略时按大小自动（<32 MB 4 条、<256 MB 6 条、更大 8 条，可被 autoThreads 关闭），显式给出则固定；服务器不支持 Range 时自动回退单连接。所有任务共享并发限制数（默认 16，= 任务数 × 线程数），超出部分排队，Agent 无法绕过。
 - \`headers\` 可选对象：Cookie / Referer / Authorization 等；遇到 401/403 必须提供。
 - \`checksum\` 可选：\`{ algorithm, value }\`，algorithm 支持 md5/sha1/sha256/sha512/crc32，完成后校验，不匹配则任务失败。
 - \`sha256\` 可选：兼容旧参数，等价于 \`checksum: { algorithm: 'sha256', value }\`。
@@ -2209,14 +2164,18 @@ const SKILL_CONTENT = `# 多线程下载器（downloader）
 
 ### action=list
 
-返回全部任务：状态、进度、速度、保存路径、错误信息。达到曲线阈值（默认 16 MB）的任务还包含 \`history\`（每秒一个 \`{t,p,s}\` 采样点）。
+返回任务：状态、进度、速度、剩余字节（\`remainingBytes\`）、预估剩余秒数（\`etaSeconds\`，仅在正在下载且速度有效时给出）、保存路径、错误信息；\`waitedSeconds\` 表示本次调用等了多少秒，\`timedOut: true\` 表示等到了超时但任务仍在跑。达到曲线阈值（默认 16 MB）的任务在面板里还有 \`history\`（每秒一个 \`{t,p,s}\` 采样点），工具输出不含它。
+
+- \`id\` 可选：只返回该任务，用来省掉整表输出；id 不存在会返回明确错误，不是空列表。
+- \`limit\` 可选：最多返回多少条（1..100，默认 20），\`total\` 是任务总数。
+- \`waitSeconds\` 可选：最多等多少秒（0..300，默认 0）。期间每秒检查一次，任务全部结束或超时后返回——**要等下载完成就用它，不要连续调用 list 轮询**。
 
 ### action=pause / resume / cancel / remove
 
 用 \`id\` 指定任务：
 
-- \`pause\`：暂停，保留已下载分片，之后可续传。
-- \`resume\`：从各分片断点继续；\`failed\` 状态也可重试。
+- \`pause\`：暂停，保留已下载分片，之后可续传；排队中的任务会直接移出队列。
+- \`resume\`：从各分片断点继续；\`failed\` 状态也可重试。已取消/已完成的任务会返回明确错误。
 - \`cancel\`：取消并删除 \`.mtd-part\` 临时文件。
 - \`remove\`：移除任务记录（必要时先取消）。
 
@@ -2224,10 +2183,38 @@ const SKILL_CONTENT = `# 多线程下载器（downloader）
 
 清空已完成/失败/已取消的任务记录。
 
+## 配套工具（与 downloader 独立）
+
+这两个工具共用插件内的同一套网络模块，但不会创建下载任务、不占连接配额，任何会话都能直接调用。
+
+### doh_lookup
+
+\`doh_lookup({ name, names?, type?, provider?, fresh? })\`
+
+- 用 DNS over HTTPS 解析域名，不依赖本机 DNS；本机解析被污染时先拿到真实 IP，再用 \`curl --resolve\` 或请求头直连。
+- \`name\` 必填，批量用 \`names\`（最多 20 个）；传 IP 时原样返回。
+- \`type\` 默认 \`A\`，\`both\` 同时查 A + AAAA；也支持 CNAME / TXT / MX / NS / SOA / PTR / SRV / CAA / HTTPS。
+- \`provider\` 可选 cloudflare / alidns / tencent，默认用插件设置；\`fresh: true\` 跳过 60 秒缓存。
+- 返回每条记录的类型、TTL、数据，以及 A/AAAA 地址列表。
+
+### http_probe
+
+\`http_probe({ url, headers?, doh?, dohProvider? })\`
+
+- 只发 HEAD，必要时补一个 \`bytes=0-0\` 的 Range 请求，不下载正文。
+- 返回大小、是否支持 Range（能否分片/续传）、Content-Disposition 文件名、ETag 与 Last-Modified。
+- 401/403 时直接说明需要 \`headers\` 提供 Cookie / Referer / Authorization；可选 \`doh: true\` 走 DoH 解析。
+
 ## 面板设置（Web GUI 侧边栏「多线程下载器」）
 
+所有设置收在面板底部的 **设置** 卡片里，默认收起，点标题展开；展开后按四组排列：**连接与带宽**、**下载与续传**、**Agent 与阈值**、**网络与站点**。收起时标题栏右侧显示当前关键值（并发数、限速、静默阈值、DoH 状态）。
+
+
+
 - **全局限速**：KB/s，0 表示不限；所有任务共享。
-- **同时下载任务数**：1..8，超出部分排队。
+- **并发限制数**：1..64，默认 16；这里限制的是**连接数**，即同时下载的任务数 × 每个任务的线程数。超出部分排队，Agent 自主模式同样受它约束、不能绕过。
+- **设备负载自适应**（默认开）：每 2 秒采样 CPU 与内存占用，压力高时立即把实际连接预算压到设定值的一部分（最多压到 20%），资源回落后每两个采样周期抬一档，约半分钟恢复满速（默认上限 16 时约 28 秒）。设备性能一般时无需手动调小并发。
+- **站点风控自适应**（默认开）：同一网站（按注册域归并，含 cdn/www 等子域和不同页面）返回 403/429/503 时，该站点自动降一档——并发 4 → 2 → 1，聚合限速 2 MB/s → 768 → 256 → 128 KB/s，并冷却 3 → 8 → 20 → 60 秒后继续；连续成功若干段后逐档恢复。**不同网站各自独立**，被风控的站点不会拖慢其它站点，也不会占用全局连接预算等待冷却。
 
 - **静默下载阈值**：带独立开关，默认开启、16 MB，单位 KB / MB / GB，范围 1 KB–10 GB。仅约束 Agent 发起的下载：小于该值时静默（不进面板/对话条/计数）；用户手动下载始终显示。关闭开关后所有任务都显示。
 - **单线程阈值**：带独立开关，默认开启、阈值 4 MB，单位 KB/MB。仅约束 Agent 发起的下载；用户手动下载始终按所选线程数分片。关闭后 Agent 任务也不做单连接降级。
@@ -2244,9 +2231,10 @@ const SKILL_CONTENT = `# 多线程下载器（downloader）
 
 ## 判断完成
 
-- 轮询 \`list\`，\`status=completed\` 且 \`receivedBytes == totalBytes\` 即完成；\`path\` 是最终保存路径。
+- 推荐：\`downloader({ action: 'list', id, waitSeconds: 60 })\`，返回时任务若已结束就是最终状态，不用轮询。
+- \`status=completed\` 且 \`receivedBytes == totalBytes\` 即完成；\`path\` 是最终保存路径。
 - \`status=failed\` 时看 \`error\`：常见为 HTTP 状态码、服务器忽略 Range、文件大小不符。
-- 进度可用 \`progress\`（0..1）；达到阈值的任务可用 \`history\` 判断速度是否稳定。
+- 想告诉用户还要多久，用 \`etaSeconds\`（任务级）或 \`/summary\` 的总 \`etaSeconds\`；进度用 \`progress\`（0..1）。
 
 ## 注意
 
@@ -2268,7 +2256,7 @@ export function apply(ctx, config) {
   const manager = new Downloader({
     directory,
     threads: numberConfig(config?.threads, 4, 1, MAX_THREADS),
-    maxConcurrent: numberConfig(config?.maxConcurrent, 3, 1, 8),
+    maxConnections: clampConnections(config?.maxConnections),
     largeFileMb: numberConfig(config?.largeFileMb, DEFAULT_LARGE_FILE_MB, 1, 10240),
     minThreadMb: numberConfig(config?.minThreadMb, DEFAULT_MIN_THREAD_MB, 0, 10240),
     minThreadEnabled: config?.minThreadEnabled !== false,
@@ -2276,6 +2264,8 @@ export function apply(ctx, config) {
     autoThreads: config?.autoThreads !== false,
     fingerprintResume: config?.fingerprintResume !== false,
     silentEnabled: config?.silentEnabled !== false,
+    loadAdaptive: config?.loadAdaptive !== false,
+    siteAdaptive: config?.siteAdaptive !== false,
     rateLimitBytes: numberConfig(config?.rateLimitKb, 102400, 0, 1024 * 1024) * 1024,
     dohEnabled: config?.dohEnabled === true,
     dohProvider: normalizeDohProvider(config?.dohProvider),
@@ -2291,6 +2281,9 @@ export function apply(ctx, config) {
       // 本地文件损坏或越界时保留配置默认值。
     }
   }
+  // 旧 schema 里已失效的键（例如 v10 的 maxConcurrent）不会被读取，
+  // 顺手把文件重写成当前 schema，避免下次启动继续带着它们。
+  if (persistedSettings.schemaVersion !== SETTINGS_SCHEMA_VERSION) manager.persistSettings()
 
   ctx.effect(() => () => {
     manager.dispose()
@@ -2304,6 +2297,8 @@ export function apply(ctx, config) {
   }, 'multithread-downloader: routes')
 
   ctx.effect(() => ctx.tools.register(makeTool(manager)), 'multithread-downloader: tool')
+  ctx.effect(() => ctx.tools.register(makeDohTool(manager)), 'multithread-downloader: doh tool')
+  ctx.effect(() => ctx.tools.register(makeProbeTool(manager)), 'multithread-downloader: probe tool')
 
   if (config?.announceToAgent !== false) {
     ctx.inject(['systemPrompt'], (scoped) => {
@@ -2342,4 +2337,4 @@ export function apply(ctx, config) {
 }
 
 /** 仅用于测试的纯函数导出；DSH 加载器会忽略额外命名导出。 */
-export const __test = { sanitizeHeaders, retryDelay, RateLimiter, probe, fetchWithRedirects, fileSha256, fileChecksum, normalizeChecksum, CHECKSUM_ALGORITHMS, freeDiskBytes, defaultDownloadDirectory, parseGithubReleaseUrl, normalizeDohProvider, DOH_PROVIDERS, autoThreadsForBytes, fingerprintChange, ifRangeValue, DownloadTask }
+export const __test = { apply, makeTool, makeRoutes, TOOL_PARAMETERS, TASK_SCHEMA, sanitizeHeaders, retryDelay, RateLimiter, ConnectionSlots, probe, fetchWithRedirects, fileSha256, fileChecksum, normalizeChecksum, CHECKSUM_ALGORITHMS, freeDiskBytes, defaultDownloadDirectory, parseGithubReleaseUrl, normalizeDohProvider, DOH_PROVIDERS, autoThreadsForBytes, fingerprintChange, ifRangeValue, DownloadTask, Downloader, LoadGovernor, ResourceSampler, SiteGovernor, SiteLimiter, siteKeyForUrl, cpuPercentBetween, loadStepFor, httpStatusOf, SITE_LEVELS, RISK_STATUS, makeDohTool, makeProbeTool, resolverFor }

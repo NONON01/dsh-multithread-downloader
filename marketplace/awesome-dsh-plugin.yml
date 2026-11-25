@@ -1,0 +1,6 @@
+url: https://github.com/NONON01/dsh-multithread-downloader
+name: NONON01/dsh-multithread-downloader
+category: tools
+description:
+  en: 'HTTP/HTTPS multi-thread downloader plugin: shards files with HTTP Range, resumes with ETag/Last-Modified verification, gives the agent downloader, doh_lookup and http_probe tools plus a progress panel, and lowers concurrency under device load or site rate limits.'
+  zh: '多线程 HTTP/HTTPS 下载插件：按 HTTP Range 分片下载，续传前用 ETag/Last-Modified 复核，向 Agent 提供 downloader、doh_lookup、http_probe 三个工具与进度面板，并在设备高负载或站点风控时自动降低并发。'

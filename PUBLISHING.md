@@ -7,7 +7,7 @@
 - 包名 `dsh-multithread-downloader`（npm 公共 registry 当前可用）
 - LICENSE (MIT)、CHANGELOG、SECURITY、PUBLISHING
 - `engines.dsh >=0.2.1-rc.2`，`peerDependencies.@deepseek-ai/dsh`
-- 单元/集成测试 57 项通过；CI 覆盖 Linux/Windows/macOS × Node 22/24
+- 单元/集成测试 67 项通过；CI 覆盖 Linux/Windows/macOS × Node 22/24
 - `npm pack` 产物已验证可解包、入口可解析
 - 明确非目标：FTP/SFTP、BT、浏览器接管、代理、HLS/DASH
 - 原生助手构建脚本 `bin/build.ps1`

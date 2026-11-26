@@ -115,7 +115,7 @@ window.__ModuleLoader__.load({
       'settings.unit': '单位',
       'settings.minThreadEnabled': '启用单线程阈值',
       'settings.autoThreads': '自动分片数',
-      'settings.autoThreadsHint': '按大小自动选 4/6/8 条连接；显式指定线程数时以指定值为准',
+      'settings.autoThreadsHint': '按大小自动选 4/6/8 条连接，每条连接被限速时运行中自动加连接（最多 8 条）；显式指定线程数时以指定值为准',
       'settings.autoThreadsOffHint': '已关闭：统一使用面板上的线程数',
       'settings.fingerprintResume': '续传指纹校验',
       'settings.fingerprintResumeHint': '续传前与收尾核对 ETag/Last-Modified，分片请求带 If-Range；远端换版本会自动从头重下',
@@ -246,7 +246,7 @@ window.__ModuleLoader__.load({
       'settings.unit': 'Unit',
       'settings.minThreadEnabled': 'Enable single-connection threshold',
       'settings.autoThreads': 'Automatic thread count',
-      'settings.autoThreadsHint': 'Picks 4/6/8 connections by size; an explicit threads value still wins',
+      'settings.autoThreadsHint': 'Picks 4/6/8 connections by size and climbs while every connection stays rate-limited (up to 8); an explicit threads value still wins',
       'settings.autoThreadsOffHint': 'Off: always use the panel thread count',
       'settings.fingerprintResume': 'Resume fingerprint check',
       'settings.fingerprintResumeHint': 'Checks ETag/Last-Modified before resuming and at the end; chunk requests carry If-Range, and a changed remote file restarts the download',
@@ -591,7 +591,7 @@ button:has(> span > .mtd-icon) { position: relative; }
      * 侧边栏徽标与对话进度条共用的汇总状态：只在有订阅者时轮询 /summary，
      * 1 秒一次；字段没变化就不通知 React，空闲时几乎没有开销。
      */
-    const EMPTY_SUMMARY = { unfinished: 0, active: 0, totalBytes: 0, receivedBytes: 0, speed: 0, top: null, tasks: [] }
+    const EMPTY_SUMMARY = { unfinished: 0, active: 0, totalBytes: 0, receivedBytes: 0, speed: 0, etaSeconds: 0, top: null, tasks: [] }
     const summaryState = { data: EMPTY_SUMMARY, listeners: new Set(), timer: null, inFlight: false }
 
     function refreshSummary() {
@@ -606,6 +606,7 @@ button:has(> span > .mtd-icon) { position: relative; }
             totalBytes: Number(data.totalBytes) || 0,
             receivedBytes: Number(data.receivedBytes) || 0,
             speed: Number(data.speed) || 0,
+            etaSeconds: Number(data.etaSeconds) || 0,
             top: data.top ?? null,
             tasks: Array.isArray(data.tasks) ? data.tasks : [],
           }
@@ -1038,7 +1039,11 @@ button:has(> span > .mtd-icon) { position: relative; }
           ? sum + Math.max(0, task.totalBytes - task.receivedBytes)
           : sum
       ), 0)
-      const etaSeconds = speed > 0 && remainingBytes > 0 ? Math.max(1, Math.round(remainingBytes / speed)) : 0
+      const etaSeconds = meta !== null && Number(meta.etaSeconds) > 0
+        ? Math.round(Number(meta.etaSeconds))
+        : speed > 0 && remainingBytes > 0
+          ? Math.max(1, Math.round(remainingBytes / speed))
+          : 0
       const thresholdBytes = largeFileBytes !== undefined ? largeFileBytes : 16 * 1024 * 1024
 
       const browse = async () => {
@@ -1809,8 +1814,9 @@ button:has(> span > .mtd-icon) { position: relative; }
       )
     }
 
-    /** 收起后的窄条：宽箭头 + 任务数，点击重新展开。 */
-    function DockRestore({ t, count, percent, onShow }) {
+    /** 收起后的窄条：宽箭头 + 任务数 + 预估剩余，点击重新展开。 */
+    function DockRestore({ t, count, percent, etaSeconds, onShow }) {
+      const label = `${fill(t('dock.tasks'), { count })} · ${percent}%${etaSeconds > 0 ? ` · ${fill(t('task.eta'), { eta: formatEta(etaSeconds) })}` : ''}`
       return h(
         'button',
         {
@@ -1818,10 +1824,10 @@ button:has(> span > .mtd-icon) { position: relative; }
           className: 'mtd-dock-restore',
           onClick: onShow,
           title: t('dock.show'),
-          'aria-label': t('dock.show'),
+          'aria-label': `${t('dock.show')}: ${label}`,
         },
         h(DockChevron, { up: true }),
-        h('span', null, `${fill(t('dock.tasks'), { count })} · ${percent}%`),
+        h('span', null, label),
       )
     }
 
@@ -1847,6 +1853,7 @@ button:has(> span > .mtd-icon) { position: relative; }
           t,
           count: summary.unfinished,
           percent: Math.round(pct * 100),
+          etaSeconds: summary.etaSeconds,
           onShow: () => setHidden(false),
         })
       }

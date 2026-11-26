@@ -29,6 +29,7 @@ import {
   describeHttpError,
   fetchWithRedirects,
   fingerprintChange,
+  headersForRedirect,
   httpErrorFor,
   httpStatusOf,
   ifRangeValue,
@@ -39,6 +40,7 @@ import {
   resolveGithubAsset,
   retryDelay,
   sanitizeHeaders,
+  signedUrlExpiry,
 } from './lib/net.js'
 import { CHECKSUM_ALGORITHMS, fileChecksum, fileSha256, normalizeChecksum } from './lib/checksum.js'
 import {
@@ -53,6 +55,7 @@ import {
   SiteLimiter,
   cpuPercentBetween,
   loadStepFor,
+  memoryPressurePercent,
   siteKeyForUrl,
   sleep,
 } from './lib/limits.js'
@@ -72,6 +75,42 @@ const MAX_ACTIVE_TASKS = 32
 /** 每个连接一次最多读这么多，读完让出槽位，保证多任务在预算内轮转而不是被一个任务占满。 */
 const CONNECTION_PIECE_BYTES = 4 * 1024 * 1024
 const MIN_CHUNK_BYTES = 512 * 1024
+/**
+ * 还值得一分为二的最小剩余量：两半各 256 KB。
+ *
+ * 收尾时最后剩下的几段往往只有 1 MB 出头，如果按「两半都得有一个分片那么大」，
+ * 就一段都切不动了 —— 连接明明空着，尾巴却由 4 条连接慢慢啃。
+ * 单连接被限速（300 KB/s）时，256 KB 也要跑将近 1 秒，多一次请求换一条连接的活是划算的；
+ * 而带宽已经吃满的站点本来就不会走到这条分支（单连接速度够高时不允许爬升）。
+ */
+const MIN_SPLIT_BYTES = 256 * 1024
+/**
+ * 分片数爬升：任务起步后的分片数不是终局。
+ *
+ * 起步分片数由「大小阶梯 4/6/8」或显式线程数决定，但很多站点的瓶颈是**每条连接被限速**
+ * （单线程 300 KB/s），而不是总带宽：4 条连接只能跑 1.2 MB/s，而全局预算里还空着十几条。
+ * 早先的做法是分片数在探测后就固定了，低并发起步的任务永远追不回来。这里每 3 秒（起步阶段
+ * 每 1.2 秒）复核一次，满足条件就把一个分片的剩余区间对半切开、立刻多起一条连接 ——
+ * 已下载的字节原地保留，不需要「重启任务」把它们丢掉重下。
+ *
+ * 并发上限管的是**同时在用的连接数**，不是分片条数：先跑完的分片会把连接交还回来，
+ * 让位出去的剩余区间再交给它接着跑，所以收尾时每条连接都是满的，分片条数可能超过上限。
+ */
+const EXPAND_INTERVAL_MS = 3000
+/** 头两次复核（爬升步数少于这个值）用更短的间隔，别让起步的低并发白白耗掉前几秒。 */
+const EXPAND_FIRST_INTERVAL_MS = 1200
+/** 爬升到这个步数之前都算「起步阶段」，复核用短间隔。 */
+const EXPAND_RAMP_STEPS = 4
+/** 已下载达到这个比例就算收尾：只在尾巴已经不够再切时才停止爬升。 */
+const EXPAND_PROGRESS_MAX = 0.6
+/** 剩余不足这个量级就算收尾（文件本身更小时按总量的一半再收一次），同上。 */
+const EXPAND_MIN_REMAINING_BYTES = 8 * 1024 * 1024
+/** 每次复核最多加几条连接：加得太急会和站点限速叠加，反而更容易撞风控。 */
+const EXPAND_PER_TICK = 2
+/** 每条连接平均低于这个速度，才认为瓶颈在「单连接被限速」而不是带宽已经吃满。 */
+const EXPAND_SLOW_PER_CONNECTION_BPS = 640 * 1024
+/** 自动阶梯（4/6/8）之外，爬升允许到达的上限；显式指定的线程数仍按指定值固定。 */
+const ESCALATE_MAX_THREADS = 8
 /** 超过该大小的任务才记录并返回进度采样历史（面板据此绘制曲线）。 */
 const DEFAULT_LARGE_FILE_MB = 16
 const DEFAULT_MIN_THREAD_MB = 4
@@ -82,6 +121,15 @@ const DISK_MARGIN_BYTES = 32 * 1024 * 1024
  * 不能让这个分片永远占着全局连接槽。超过这个时间没有新字节就中断并重试。
  */
 const BODY_IDLE_TIMEOUT_MS = 30_000
+/**
+ * 跟随重定向后的最终地址复用时长上限。
+ * GitHub Release 资产走 api.github.com 时每次请求都会吃掉 60 次/小时的配额，
+ * 而 302 指向的签名地址本身支持 Range、有效期约 1 小时，所以分片直接打它；
+ * 没带过期时间的普通跳转按这个时长保守缓存。
+ */
+const REDIRECT_REUSE_MS = 5 * 60_000
+/** 最终地址到期前提前这么久就重新解析，避免最后几个分片撞上 403。 */
+const REDIRECT_EXPIRY_MARGIN_MS = 60_000
 const JSON_HEADERS = {
   'content-type': 'application/json; charset=utf-8',
   'cache-control': 'no-store',
@@ -142,6 +190,15 @@ class DownloadTask {
     this.etag = ''
     this.lastModified = ''
     this.rangeFallback = false
+    /**
+     * 跟随重定向后缓存的最终地址（例如 GitHub 302 到签名 CDN、镜像站 302 到对象存储）。
+     * 复用它能省掉每次分片都走一遍 302 的往返与配额消耗；到期或失效时回退到原地址。
+     */
+    this.remoteUrl = ''
+    this.remoteHeaders = {}
+    this.remoteExpiresAt = 0
+    this.remoteChecked = false
+    this.remotePending = null
     /** 指纹状态：''（无校验值）/ verified / unverified / changed。 */
     this.fingerprintState = ''
     this.fingerprintNote = ''
@@ -164,11 +221,25 @@ class DownloadTask {
     this.totalBytes = 0
     this.receivedBytes = 0
     this.speed = 0
+    /** 平滑后的速度，只用于预估剩余时间：秒级瞬时速度抖动太大会让 ETA 乱跳。 */
+    this.etaSpeed = 0
     this.progress = 0
     this.createdAt = Date.now()
     this.startedAt = 0
     this.finishedAt = 0
     this.chunks = []
+    /** 起步分片数（大小阶梯或显式线程数），爬升只能在这个数之上、上限之内加。 */
+    this.planThreads = 0
+    /** 本次任务通过爬升额外加出来的分片数，仅用于展示与测试观测。 */
+    this.expansions = 0
+    /**
+     * 实际同时在跑的连接数峰值。
+     * 收尾时为了让空闲连接接着干活，分片总数会超过并发上限（一个分片跑完了，
+     * 另一个还长的分片让出一半），所以「分片条数」不等于「用过几条连接」。
+     */
+    this.peakConnections = 0
+    /** 扩容时用来给新分片起一条流的回调，由 runChunksBody 的监督循环提供。 */
+    this.spawnChunk = null
     this.handle = null
     this.abort = new AbortController()
     this.sampler = null
@@ -186,9 +257,18 @@ class DownloadTask {
     const site = siteKey === '' ? null : this.manager.siteGovernor.sites.get(siteKey)
     const throttled = site !== undefined && site !== null && site.level > 0 ? site : null
     const remainingBytes = this.totalBytes > 0 ? Math.max(0, this.totalBytes - this.receivedBytes) : 0
+    // 展示用的线程数 = 当前还在跑的分片数（爬升会变多）；全部跑完后回落成「实际用过的并发」。
+    // 不能回落成分片条数：收尾让位会让分片条数超过并发上限（10 个分片、最多 8 条连接）。
+    const liveChunks = this.liveChunks()
+    const peak = Math.max(1, this.peakConnections || this.threads || 1)
+    const live = liveChunks > 0
+      ? liveChunks
+      : Math.min(Math.max(1, this.chunks.length || this.threads || 1), peak)
     // 预估剩余时间：只在正在下载、速度有效、大小已知时给出，避免给出误导性的 0 或 Infinity。
-    const etaSeconds = this.status === 'downloading' && this.speed > 0 && remainingBytes > 0
-      ? Math.max(1, Math.round(remainingBytes / this.speed))
+    // 优先用平滑速度，秒级瞬时速度的抖动会让 ETA 每秒跳一次。
+    const rate = this.etaSpeed > 0 ? this.etaSpeed : this.speed
+    const etaSeconds = this.status === 'downloading' && rate > 0 && remainingBytes > 0
+      ? Math.max(1, Math.round(remainingBytes / rate))
       : null
     const snapshot = {
       id: this.id,
@@ -205,8 +285,9 @@ class DownloadTask {
       speed: this.speed,
       ...(etaSeconds === null ? {} : { etaSeconds }),
       threads: throttled === null
-        ? (this.chunks.length > 0 ? this.chunks.length : this.threads)
-        : Math.min(this.chunks.length > 0 ? this.chunks.length : this.threads, Math.max(1, throttled.cap)),
+        ? live
+        : Math.min(live, Math.max(1, throttled.cap)),
+      ...(this.expansions > 0 ? { expandedChunks: this.expansions } : {}),
       origin: this.origin,
       doh: this.doh,
       dohProvider: this.dohProvider,
@@ -267,6 +348,7 @@ class DownloadTask {
       forceDisplay: this.forceDisplay,
       threads: this.threads,
       threadsExplicit: this.threadsExplicit,
+      planThreads: this.planThreads,
       singleThread: this.singleThread,
       createdAt: this.createdAt,
     }
@@ -294,7 +376,12 @@ class DownloadTask {
       const elapsed = Math.max(1, now - this.lastSampleAt) / 1000
       const bytes = this.receivedBytes
       const delta = Math.max(0, bytes - this.lastSample)
-      this.speed = Math.round(delta / elapsed)
+      const instant = Math.round(delta / elapsed)
+      this.speed = instant
+      // ETA 用指数平滑速度：网络本身就有毫秒级抖动，直接用瞬时速度会给出乱跳的「约剩」。
+      this.etaSpeed = this.etaSpeed > 0
+        ? Math.round(this.etaSpeed * 0.6 + instant * 0.4)
+        : instant
       this.lastSample = bytes
       this.lastSampleAt = now
       this.progress = this.totalBytes > 0 ? Math.min(1, bytes / this.totalBytes) : 0
@@ -309,6 +396,7 @@ class DownloadTask {
       this.sampler = null
     }
     this.speed = 0
+    this.etaSpeed = 0
   }
 
   begin() {
@@ -371,6 +459,64 @@ class DownloadTask {
   /** 当前正在使用的地址（镜像回退后会切换）。 */
   currentUrl() {
     return this.urls[this.urlIndex % this.urls.length]
+  }
+
+  /**
+   * 实际请求目标：跟随重定向后的最终地址。
+   *
+   * 很多站点会 302 到 CDN 或对象存储（GitHub Release 资产是 api.github.com → 签名 CDN），
+   * 每次分片都重走一遍跳转意味着两倍往返；GitHub 的 API 跳转还会计入 60 次/小时的配额，
+   * 分片一多就直接 403，进而被站点风控降到单连接。这里把最终地址连同按跨源规则
+   * 剥过凭据的请求头一起缓存，到期前所有分片直接打它，失效后再回到原地址重新解析。
+   */
+  async remoteTarget() {
+    if (this.remoteUrl !== '' && Date.now() < this.remoteExpiresAt) {
+      return { url: this.remoteUrl, headers: this.remoteHeaders }
+    }
+    // 探测时已经跟完重定向、确认原地址就是最终地址：直接用它，不要每个分片再探一次。
+    if (this.remoteChecked) return { url: this.currentUrl(), headers: this.headers }
+    if (this.remotePending !== null) return this.remotePending
+    const origin = this.currentUrl()
+    this.remotePending = (async () => {
+      const result = await probe(origin, this.abort.signal, this.headers, this.dispatcher())
+      return this.rememberTarget(origin, result)
+    })()
+    try {
+      return await this.remotePending
+    } finally {
+      this.remotePending = null
+    }
+  }
+
+  /** 记住一次探测得到的最终地址；同源、非 http(s) 或即将过期时继续用原地址。 */
+  rememberTarget(origin, result) {
+    this.forgetTarget()
+    this.remoteChecked = true
+    const finalUrl = typeof result?.finalUrl === 'string' ? result.finalUrl : ''
+    if (finalUrl === '' || finalUrl === origin) return { url: origin, headers: this.headers }
+    let parsed
+    try {
+      parsed = new URL(finalUrl)
+    } catch {
+      return { url: origin, headers: this.headers }
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return { url: origin, headers: this.headers }
+    }
+    const expiry = signedUrlExpiry(parsed) || Date.now() + REDIRECT_REUSE_MS
+    // 已经过期的签名地址没有复用价值：继续走原地址，让服务端重新签一个。
+    if (expiry - REDIRECT_EXPIRY_MARGIN_MS <= Date.now()) return { url: origin, headers: this.headers }
+    this.remoteUrl = finalUrl
+    this.remoteHeaders = headersForRedirect(this.headers, origin, finalUrl)
+    this.remoteExpiresAt = expiry - REDIRECT_EXPIRY_MARGIN_MS
+    return { url: finalUrl, headers: this.remoteHeaders }
+  }
+
+  forgetTarget() {
+    this.remoteUrl = ''
+    this.remoteHeaders = {}
+    this.remoteExpiresAt = 0
+    this.remoteChecked = false
   }
 
   /**
@@ -443,6 +589,8 @@ class DownloadTask {
     this.abort = new AbortController()
     const result = await this.probeAny()
     if (this.runToken !== run || this.status !== 'probing') return
+    // 探测已经跟完一次重定向：把最终地址存下来，后面所有分片直接打它。
+    this.rememberTarget(this.url, result)
     this.totalBytes = result.size
     this.etag = result.etag ?? ''
     this.lastModified = result.lastModified ?? ''
@@ -483,6 +631,13 @@ class DownloadTask {
   }
 
   buildChunks(result) {
+    const chunks = this.planChunks(result)
+    // 起步分片数记下来：爬升只能在这个基础之上、上限之内加，不会把「显式 2 线程」变成 8 条。
+    this.planThreads = chunks.length
+    return chunks
+  }
+
+  planChunks(result) {
     if (!result.ranges || this.totalBytes <= 0) {
       // 服务器不支持 Range：单连接全量下载，不发 Range 头。
       return [{ start: 0, end: -1, cursor: 0, total: this.totalBytes }]
@@ -515,6 +670,191 @@ class DownloadTask {
     return chunks
   }
 
+  /** 还在跑（或还没跑完）的分片数：判断并发是否已经到位要看这个，而不是历史条数。 */
+  liveChunks() {
+    let live = 0
+    for (const chunk of this.chunks) {
+      if (chunk.end < 0) {
+        live += 1
+        continue
+      }
+      if (chunk.start + chunk.cursor <= chunk.end) live += 1
+    }
+    return live
+  }
+
+  /** 记下这一刻真正在连接上跑着的分片数，用来在收尾后如实展示「用了几条连接」。 */
+  noteInflight() {
+    let live = 0
+    for (const chunk of this.chunks) {
+      if (chunk.inflight === true) live += 1
+    }
+    if (live > this.peakConnections) this.peakConnections = live
+  }
+
+  /** 分片数上限：自动阶梯可以爬到 ESCALATE_MAX_THREADS，显式指定的线程数保持固定。 */
+  escalationTarget() {
+    if (this.chunks.length === 0) return 1
+    // 服务器不支持 Range（end < 0）或已回退单连接：没法把剩余区间切开。
+    if (this.chunks.length === 1 && this.chunks[0].end < 0) return 1
+    const budget = Math.max(1, Math.round(this.manager.maxConnections) || 1)
+    const hard = Math.max(1, Math.min(MAX_THREADS, budget))
+    if (this.threadsExplicit) return Math.min(hard, Math.max(1, this.threads))
+    if (!this.manager.autoThreads) return Math.min(hard, Math.max(1, this.threads))
+    const planned = this.planThreads > 0 ? this.planThreads : this.chunks.length
+    return Math.min(hard, Math.max(planned, ESCALATE_MAX_THREADS))
+  }
+
+  /** 爬升的间隔与阈值：允许管理器（含测试）覆盖，默认取常量。 */
+  expandPolicy() {
+    const manager = this.manager
+    const pick = (value, fallback) => (Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : fallback)
+    return {
+      intervalMs: Math.max(50, pick(manager.expandIntervalMs, EXPAND_INTERVAL_MS)),
+      progressMax: Math.min(1, Math.max(0.05, pick(manager.expandProgressMax, EXPAND_PROGRESS_MAX))),
+      minRemainingBytes: Math.max(0, pick(manager.expandMinRemainingBytes, EXPAND_MIN_REMAINING_BYTES)),
+      slowPerConnectionBps: Math.max(0, pick(manager.expandSlowPerConnectionBps, EXPAND_SLOW_PER_CONNECTION_BPS)),
+    }
+  }
+
+  /**
+   * 剩余量下限：默认 8 MB，但文件本身更小时按总量的一半算 ——
+   * 20 MB 的文件下到 45% 时只剩 11 MB，用 8 MB 的硬门槛会把它挡在爬升之外。
+   */
+  remainingFloor(policy = this.expandPolicy()) {
+    if (!(this.totalBytes > 0)) return policy.minRemainingBytes
+    return Math.min(policy.minRemainingBytes, this.totalBytes * 0.5)
+  }
+
+  /**
+   * 复核一次是否可以爬升：挑一个分片，把它的剩余区间对半切开，
+   * 前半段留给原来的分片继续跑，后半段交给新起的连接。切分按字节偏移进行，
+   * 已下载的部分一行不动，因此不需要「重置任务」——重置只会把已下的字节重下一遍。
+   *
+   * 只在「慢、并且真的有连接闲着」时动手：带宽已经吃满（每条连接都很快）、
+   * 站点被风控降档、或者全局预算正被别人用着，都不该再加连接。
+   *
+   * 进度和剩余量的门槛只用来挡「尾巴已经不够再切」的情形 —— 早先它们是硬门槛，
+   * 结果到了收尾阶段，先跑完的分片把连接交还回来，剩下的尾巴却还压在一两个分片上慢慢爬。
+   * 只要尾巴还够分成两个像样的分片，把空闲连接用起来永远是净赚。
+   */
+  maybeEscalate() {
+    if (this.status !== 'downloading' || this.spawnChunk === null) return false
+    if (this.abort.signal.aborted || this.superseded) return false
+    if (this.chunks.length === 0) return false
+    const target = this.escalationTarget()
+    // 用「还没跑完的分片数」判断是否已经到位：已经结束的分片不该继续占着名额。
+    if (this.liveChunks() >= target) return false
+    const policy = this.expandPolicy()
+    const remaining = this.totalBytes > 0 ? Math.max(0, this.totalBytes - this.receivedBytes) : 0
+    // 收尾阶段（进度过半、或剩余已低于下限）只保留一个硬门槛：尾巴还得够切开。
+    const late = (this.totalBytes > 0 && this.receivedBytes / this.totalBytes >= policy.progressMax)
+      || remaining < this.remainingFloor(policy)
+    if (late && remaining < MIN_SPLIT_BYTES * 2) return false
+    // 还没有速度采样（刚开始、或者一直没有数据进来）时不扩容：没有「单连接被限速」的证据，
+    // 而一直失败的情形（416、连不通）加连接只会多出一串无谓请求。
+    if (!(this.speed > 0)) return false
+    // 平均每条连接的速度还很高：说明带宽（而不是单连接配额）才是瓶颈，加连接只会互相抢。
+    if (this.speed / Math.max(1, this.liveChunks()) >= policy.slowPerConnectionBps) return false
+    // 站点被降档时瓶颈是站点配额，不是我们的分片数：这时候加连接只会更快撞风控。
+    const site = this.manager.siteAdaptive ? this.manager.siteGovernor.limiterFor(this.currentUrl()) : null
+    if (site !== null && site.level > 0) return false
+    // 没有空闲预算就不抢别人的连接。
+    const slots = this.manager.slots
+    if (slots !== undefined && slots !== null && slots.used >= slots.limit) return false
+    // 只切「不会被在途请求写到」的地方：
+    // - 空闲分片：游标之后全是自由区间；
+    // - 在途分片：在途那一段（pieceEnd）已经算好并可能正在写，只能从它之后切。
+    //   分段只有 4 MB，而慢速连接下一段要跑好几秒，等它跑完再扩容就没意义了。
+    let carrier = null
+    let carrierLeft = 0
+    let carrierCut = 0
+    for (const chunk of this.chunks) {
+      if (chunk.end < 0) continue
+      const position = chunk.start + chunk.cursor
+      const pieceEnd = Number(chunk.pieceEnd)
+      const guard = chunk.inflight === true
+        ? Math.max(position, (Number.isFinite(pieceEnd) && pieceEnd >= 0 ? pieceEnd : position) + 1)
+        : position
+      const left = chunk.end - guard + 1
+      // 两半都要够得着「值得再开一条连接」的尺寸：切出一个 100 KB 的尾巴只会多一次请求。
+      if (left < MIN_SPLIT_BYTES * 2 || left <= carrierLeft) continue
+      carrier = chunk
+      carrierLeft = left
+      carrierCut = guard + Math.floor(left / 2)
+    }
+    if (carrier === null) return false
+    const cut = carrierCut
+    if (cut > carrier.end) return false
+    const originalEnd = carrier.end
+    carrier.end = cut - 1
+    carrier.total = carrier.end - (carrier.start + carrier.cursor) + 1
+    const tail = { start: cut, end: originalEnd, cursor: 0, total: originalEnd - cut + 1 }
+    this.chunks.push(tail)
+    this.expansions += 1
+    this.spawnChunk(tail)
+    this.manager.persistTasks?.()
+    return true
+  }
+
+  /**
+   * 当前是否还留着爬升空间：只有这时才值得把分段切细（留出可切分的位置）。
+   * 已经到上限（含显式线程数）、或者尾巴已经不够再切时，分段回到 4 MB，
+   * 免得为了一个用不上的切分点给每个下载都多加好几次请求。
+   */
+  splitFriendly() {
+    if (this.manager.threadEscalation === false) return false
+    if (this.chunks.length === 0) return false
+    if (this.chunks.length === 1 && this.chunks[0].end < 0) return false
+    if (this.liveChunks() >= this.escalationTarget()) return false
+    const policy = this.expandPolicy()
+    const remaining = this.totalBytes > 0 ? Math.max(0, this.totalBytes - this.receivedBytes) : 0
+    const late = (this.totalBytes > 0 && this.receivedBytes / this.totalBytes >= policy.progressMax)
+      || remaining < this.remainingFloor(policy)
+    // 收尾阶段照样要留切分点：空闲连接还要靠它接活，只有尾巴太小才放弃。
+    if (late && remaining < MIN_SPLIT_BYTES * 2) return false
+    return true
+  }
+
+  /**
+   * 定时复核爬升；任务结束/暂停后自行停止。
+   * 定时器只做判定，真正的并发由 runChunk 里的全局配额把关；
+   * 每次最多加 EXPAND_PER_TICK 条，避免一次把站点打醒。
+   *
+   * 头两次复核用更短的间隔：起步并发往往只是「还没爬起来」，
+   * 跟第一次复核隔 3 秒，等于白白用低并发下掉前 10% 的文件。
+   */
+  startExpansion(run) {
+    if (this.manager.threadEscalation === false) return { stop() {} }
+    const { intervalMs } = this.expandPolicy()
+    const firstMs = Math.max(50, Math.min(intervalMs, EXPAND_FIRST_INTERVAL_MS))
+    let timer = null
+    let stopped = false
+    const tick = () => {
+      timer = null
+      if (stopped) return
+      if (this.runToken !== run || this.status !== 'downloading') return
+      try {
+        for (let step = 0; step < EXPAND_PER_TICK; step += 1) {
+          if (!this.maybeEscalate()) break
+        }
+      } catch {
+        // 扩容是优化项：任何异常都不该影响正在进行的下载。
+      }
+      const wait = this.expansions < EXPAND_RAMP_STEPS ? firstMs : intervalMs
+      timer = setTimeout(tick, wait)
+      timer.unref?.()
+    }
+    timer = setTimeout(tick, firstMs)
+    timer.unref?.()
+    return {
+      stop: () => {
+        stopped = true
+        if (timer !== null) clearTimeout(timer)
+      },
+    }
+  }
+
   /**
    * 分片循环：每次向全局连接预算占一个槽，读完一小段（4 MB）就归还，
    * 再重新排队，多个任务因此能轮转，而不是先来的任务一口气占满全部预算。
@@ -544,13 +884,35 @@ class DownloadTask {
         slot = await this.manager.slots.acquire(this.abort.signal)
         if (slot === null) return
         if (this.runToken !== run) return
+        // 排队期间爬升可能把这个分片的尾巴切给了新连接：拿到槽位后重新读游标，
+        // 用已经算好的 position 会越过新的 end，写出一个本不属于本分片的区间。
+        const from = chunk.start + chunk.cursor
+        if (chunk.end >= 0 && from > chunk.end) return
         // 单连接整段下载没有终点；分片只取一小段，让出槽位给其它任务。
-        const pieceEnd = chunk.end < 0 ? -1 : Math.min(chunk.end, position + CONNECTION_PIECE_BYTES - 1)
-        await this.pullChunk(chunk, position, pieceEnd, site, run)
+        // 还有爬升空间时分段不超过「本分片剩余量的一半」：一个 4 MB 请求把整段一次吃完时，
+        // 中途没有任何时刻可以安全切分，爬升就只能等它跑完（慢速连接下等于永远等不到）。
+        const leftInChunk = chunk.end < 0 ? -1 : chunk.end - from + 1
+        const pieceBytes = leftInChunk < 0 || !this.splitFriendly()
+          ? CONNECTION_PIECE_BYTES
+          : Math.max(MIN_CHUNK_BYTES, Math.min(CONNECTION_PIECE_BYTES, Math.ceil(leftInChunk / 2)))
+        const pieceEnd = chunk.end < 0 ? -1 : Math.min(chunk.end, from + pieceBytes - 1)
+        chunk.inflight = true
+        // 记下在途区间：爬升只允许从这段之后切，否则正在写的这一段会被切走。
+        chunk.pieceEnd = pieceEnd
+        this.noteInflight()
+        try {
+          await this.pullChunk(chunk, from, pieceEnd, site, run)
+        } finally {
+          chunk.inflight = false
+          chunk.pieceEnd = -1
+        }
         // 这一段成功，退避计数清零：同一个分片的后续小段从头计数；
         // 站点连续成功够了就回落一档，恢复并发与带宽。
         attempts = 0
         if (site !== null) site.reward()
+        // 单连接整段下载（服务器不支持 Range）读到 EOF 就结束这一轮。
+        // 少了这一句，while 会以每秒几十次的速度把整个文件重下一遍。
+        if (chunk.end < 0) return
       } catch (error) {
         // 本轮已被换掉（pause 后立刻 resume、或重启重开）：不要动新一轮的状态。
         if (this.runToken !== run) return
@@ -562,7 +924,12 @@ class DownloadTask {
         if (this.status !== 'downloading' || this.abort.signal.aborted) return
         const status = httpStatusOf(error)
         const timedOut = error?.name === 'AbortError' && !this.abort.signal.aborted
-        if (status !== undefined && RISK_STATUS.has(status) && this.manager.siteAdaptive) {
+        if (error?.code === 'TARGET_STALE') {
+          // 缓存的重定向地址过期：重新解析后再来。既不算站点风控，也不算网络失败。
+          attempts += 1
+          if (attempts >= MAX_ATTEMPTS) throw error
+          retry = true
+        } else if (status !== undefined && RISK_STATUS.has(status) && this.manager.siteAdaptive) {
           // 站点风控：降档 + 冷却后再来，重试预算与网络重试分开计。
           if (this.registerSiteRisk(url, status) === 'exhausted') {
             throw new Error(`${describeHttpError(status)}（站点已限速重试 ${this.riskRetries} 次仍被拒绝）`)
@@ -575,7 +942,10 @@ class DownloadTask {
         } else {
           attempts += 1
           if (attempts >= MAX_ATTEMPTS) throw error
-          if (this.urls.length > 1) this.urlIndex = (this.urlIndex + 1) % this.urls.length
+          if (this.urls.length > 1) {
+            this.urlIndex = (this.urlIndex + 1) % this.urls.length
+            this.forgetTarget()
+          }
           retry = true
           retryAfterMs = Number(error?.retryAfterMs) || 0
         }
@@ -592,23 +962,44 @@ class DownloadTask {
     }
   }
 
+  /**
+   * 服务器对 Range 请求回了 200 时，用响应里的指纹判断到底是「换了版本」还是
+   * 「压根不支持 Range」。拿不到可比较的指纹时返回 false：单连接重下总能拿到正确文件，
+   * 而错判成版本变化会让任务在「重开后仍然 200」的循环里失败。
+   */
+  remoteChanged(freshEtag, freshModified) {
+    if (freshEtag !== '' && this.etag !== '') return freshEtag !== this.etag
+    if (freshModified !== '' && this.lastModified !== '') return freshModified !== this.lastModified
+    return false
+  }
+
   /** 一次分段请求：发 Range、校验响应状态、把正文写进分片文件。 */
   async pullChunk(chunk, position, pieceEnd, site = null, run = null) {
     let release = null
     try {
-      const headers = { 'accept-encoding': 'identity', 'user-agent': USER_AGENT, ...this.headers }
+      const target = await this.remoteTarget()
+      if (this.runToken !== run || this.status !== 'downloading') return
+      // 跨源跳转后不能把 Cookie / Authorization 继续发过去，headersForRedirect 已剥掉。
+      const headers = { 'accept-encoding': 'identity', 'user-agent': USER_AGENT, ...target.headers }
       // 续传/分片请求带上 If-Range：远端换了版本时服务器回 200，我们据此重新开始，而不是拼错内容。
       const ifRange = chunk.end >= 0 ? ifRangeValue(this.etag, this.lastModified) : ''
       if (pieceEnd >= 0) {
         headers.range = `bytes=${position}-${pieceEnd}`
         if (ifRange !== '') headers['if-range'] = ifRange
       }
-      const url = this.currentUrl()
-      const fetched = await fetchWithRedirects(url, { headers, dispatcher: this.dispatcher() }, this.abort.signal)
+      const usingCachedTarget = target.url !== this.currentUrl()
+      const fetched = await fetchWithRedirects(target.url, { headers, dispatcher: this.dispatcher() }, this.abort.signal)
       release = fetched.release
       const response = fetched.response
       if (response.status === 401 || response.status === 403 || response.status === 407) {
         await response.body?.cancel().catch(() => {})
+        // 缓存的签名直链过期/失效：丢掉缓存重解析一次，别把它当成站点风控降档。
+        if (usingCachedTarget) {
+          this.forgetTarget()
+          const stale = new Error(`HTTP ${response.status}：缓存的重定向地址已失效`)
+          stale.code = 'TARGET_STALE'
+          throw stale
+        }
         throw new Error(describeHttpError(response.status))
       }
       // 416 不是「本段已完成」：远端在说自己没有这个字节范围。早先这里直接 return，
@@ -622,7 +1013,12 @@ class DownloadTask {
       if (!response.ok) throw httpErrorFor(response.status, response)
       if (pieceEnd >= 0 && response.status === 200) {
         await response.body?.cancel().catch(() => {})
-        if (ifRange !== '') {
+        // 回 200 有两种原因：远端换了版本（If-Range 不匹配），或服务端根本不认 Range。
+        // 只有指纹确实变了才按「版本变化」重下；指纹一致或拿不到指纹时按「忽略 Range」
+        // 回退单连接——否则一个不支持 Range 的站点会把任务直接判失败。
+        const freshEtag = response.headers.get('etag') ?? ''
+        const freshModified = response.headers.get('last-modified') ?? ''
+        if (ifRange !== '' && this.remoteChanged(freshEtag, freshModified)) {
           this.superseded = true
           this.fingerprintState = 'changed'
           this.fingerprintNote = '下载过程中远端文件已变化，已自动从头重新下载'
@@ -664,7 +1060,12 @@ class DownloadTask {
       }
       if (this.runToken !== run || this.status !== 'downloading') return
       // 单连接整段下载或已读满本段：正常结束；有进展但没读满则回到循环继续要剩余部分。
-      if (pieceEnd < 0 || cursor > pieceEnd || cursor > position) return
+      if (pieceEnd < 0) {
+        // 无 Range 模式没法从中间续传，正文短了只能报错，重试会拼出重复内容。
+        if (this.totalBytes > 0 && cursor < this.totalBytes) throw new Error('连接提前结束：远端未发完整文件')
+        return
+      }
+      if (cursor > pieceEnd || cursor > position) return
       throw new Error('连接提前结束')
     } finally {
       if (release !== null) release()
@@ -731,6 +1132,7 @@ class DownloadTask {
     if (reason === '') {
       this.fingerprintState = this.hasValidator() ? 'verified' : ''
       this.fingerprintNote = ''
+      this.rememberTarget(this.url, fresh)
       return
     }
     this.fingerprintState = 'changed'
@@ -754,6 +1156,7 @@ class DownloadTask {
     this.superseded = false
     this.closeHandle()
     const result = await this.probeAny()
+    this.rememberTarget(this.url, result)
     this.totalBytes = result.size > 0 ? result.size : 0
     if (this.totalBytes <= 0) throw new Error('远端文件已变化，且重新探测未拿到文件大小')
     this.etag = result.etag ?? ''
@@ -772,6 +1175,8 @@ class DownloadTask {
   async restartSingleStream() {
     this.rangeFallback = true
     this.chunks = [{ start: 0, end: -1, cursor: 0, total: this.totalBytes }]
+    this.planThreads = 1
+    this.expansions = 0
     this.receivedBytes = 0
     this.progress = 0
     this.history = []
@@ -835,30 +1240,83 @@ class DownloadTask {
     // 续传起点补一个采样，曲线在暂停区间保持水平而不是斜线。
     this.recordHistory(Date.now())
     this.startSampler()
-    const settled = await Promise.allSettled(this.chunks.map((chunk) => this.runChunk(chunk, run)))
+    // 本轮是一个「动态分片池」：起步分片各起一条流，爬升时再把新切出来的分片塞进来。
+    const expansion = this.startExpansion(run)
+    let failed = null
+    try {
+      failed = await this.superviseChunks(run)
+    } finally {
+      expansion.stop()
+      this.spawnChunk = null
+    }
     // 本轮已被 pause/resume 或重启换掉：旧轮的收尾必须放弃，否则会误判新一轮。
     if (this.runToken !== run) return
     if (this.status !== 'downloading') return
-    const failed = settled.find((entry) => entry.status === 'rejected')
-    if (failed !== undefined) {
-      if (failed.reason?.code === 'FINGERPRINT_CHANGED' && !this.freshRestart) {
+    if (failed !== null) {
+      if (failed?.code === 'FINGERPRINT_CHANGED' && !this.freshRestart) {
         await this.restartFresh()
         return
       }
       // 416：远端否认这些字节范围。只重建一次分片，再失败就明确报错。
-      if (failed.reason?.code === 'RANGE_UNSATISFIABLE' && !this.rangeRebuild) {
+      if (failed?.code === 'RANGE_UNSATISFIABLE' && !this.rangeRebuild) {
         this.rangeRebuild = true
         await this.restartFresh()
         return
       }
-      if (failed.reason?.code === 'RANGE_IGNORED' && !this.rangeFallback) {
+      if (failed?.code === 'RANGE_IGNORED' && !this.rangeFallback) {
         await this.restartSingleStream()
         return
       }
-      this.fail(failed.reason)
+      this.fail(failed)
       return
     }
     await this.finalize()
+  }
+
+  /**
+   * 跑完本轮的全部分片。语义和原来的 Promise.allSettled 一致（返回第一个失败原因），
+   * 区别是分片集合可以在运行中被爬升追加：新分片会立刻起一条流，并计入活跃计数，
+   * 直到所有分片（含后来加入的）都结束才返回。
+   */
+  async superviseChunks(run) {
+    let active = 0
+    let failure = null
+    let idle = null
+    const spawn = (chunk) => {
+      active += 1
+      chunk.running = true
+      this.runChunk(chunk, run).then(
+        () => undefined,
+        (error) => {
+          if (failure === null) failure = error
+        },
+      ).finally(() => {
+        chunk.running = false
+        active -= 1
+        // 一条连接刚交还：立刻把还长的剩余区间分一段给它接着跑，比等下一次定时复核快得多。
+        // 必须在 active === 0 的判定之前：扩容会把 active 加回去，不能让监督循环误判收尾。
+        try {
+          if (this.status === 'downloading' && this.runToken === run) this.maybeEscalate()
+        } catch {
+          // 扩容是优化项：这里出任何问题都不该影响收尾。
+        }
+        if (active === 0 && idle !== null) {
+          const resume = idle
+          idle = null
+          resume()
+        }
+      })
+    }
+    this.spawnChunk = spawn
+    for (const chunk of this.chunks) spawn(chunk)
+    if (active > 0) {
+      await new Promise((resolve) => {
+        idle = resolve
+        if (active === 0) resolve()
+      })
+    }
+    this.spawnChunk = null
+    return failure
   }
 
   /** 收尾复核：下载期间远端若被替换（未触发 If-Range 的服务器），拒绝交付混合文件。 */
@@ -866,7 +1324,9 @@ class DownloadTask {
     if (!this.manager.fingerprintResume || !this.hasValidator()) return
     let fresh
     try {
-      fresh = await probe(this.url, this.abort.signal, this.headers, this.dispatcher())
+      // 直接查缓存的最终地址：既省一次 302 往返，也避免再吃一次 GitHub API 配额。
+      const target = await this.remoteTarget()
+      fresh = await probe(target.url, this.abort.signal, target.headers, this.dispatcher())
     } catch {
       this.fingerprintState = 'unverified'
       this.fingerprintNote = '完成前未能复核远端指纹（探测失败），文件按已下载字节交付'
@@ -1111,10 +1571,16 @@ class Downloader {
     return this.slots.limit
   }
 
-  /** 采样回调：压力高立即收缩，压力低逐步恢复；预算变化同步任务数上限。 */
+  /** 采样回调：压力高收缩、压力低逐步恢复，空闲时回到用户设定值。 */
   applyResourceSample(sample) {
     this.lastResources = sample
-    const limit = this.loadGovernor.observe(sample.cpuPct, sample.memoryPct)
+    const limit = this.loadGovernor.observe(sample.cpuPct, sample.memoryPct, {
+      // 没有连接在跑时收缩没有意义：下一次任务会带着被压低的预算起步，
+      // 低配机器上就表现为「上限 5，实际一直 1 条连接」。
+      active: this.slots.used > 0,
+      freeBytes: sample.freeBytes,
+      now: sample.takenAt,
+    })
     this.applyConnectionBudget(limit)
   }
 
@@ -1144,6 +1610,7 @@ class Downloader {
       enabled: this.loadAdaptive,
       cpuPct: governor.cpuPct === null ? null : Math.round(governor.cpuPct),
       memoryPct: governor.memoryPct === null ? null : Math.round(governor.memoryPct),
+      memoryPressure: Math.round(governor.memoryPressure ?? 0),
       pressure: governor.pressure === null ? null : Math.round(governor.pressure),
       level: governor.level,
       baseConnections: governor.base,
@@ -1170,6 +1637,7 @@ class Downloader {
     let totalBytes = 0
     let receivedBytes = 0
     let speed = 0
+    let etaSpeed = 0
     let downloadingRemaining = 0
     let top = null
     const tasks = []
@@ -1177,6 +1645,7 @@ class Downloader {
       if (task.status !== 'queued' && task.status !== 'probing' && task.status !== 'downloading' && task.status !== 'paused') continue
       if (!this.shouldDisplay(task)) continue
       const remainingBytes = task.totalBytes > 0 ? Math.max(0, task.totalBytes - task.receivedBytes) : 0
+      const rate = task.etaSpeed > 0 ? task.etaSpeed : task.speed
       const entry = {
         id: task.id,
         filename: task.filename,
@@ -1187,8 +1656,8 @@ class Downloader {
         totalBytes: task.totalBytes,
         receivedBytes: task.receivedBytes,
         remainingBytes,
-        ...(task.status === 'downloading' && task.speed > 0 && remainingBytes > 0
-          ? { etaSeconds: Math.max(1, Math.round(remainingBytes / task.speed)) }
+        ...(task.status === 'downloading' && rate > 0 && remainingBytes > 0
+          ? { etaSeconds: Math.max(1, Math.round(remainingBytes / rate)) }
           : {}),
       }
       tasks.push(entry)
@@ -1197,11 +1666,13 @@ class Downloader {
       receivedBytes += task.receivedBytes
       if (task.status === 'downloading') {
         speed += task.speed
+        etaSpeed += rate
         downloadingRemaining += remainingBytes
       }
       if (top === null || (top.status !== 'downloading' && task.status === 'downloading')) top = entry
     }
-    const etaSeconds = speed > 0 && downloadingRemaining > 0 ? Math.max(1, Math.round(downloadingRemaining / speed)) : null
+    // 聚合 ETA 用平滑速度：面板与输入框上方的进度条每秒刷新一次，瞬时速度会让「约剩」乱跳。
+    const etaSeconds = etaSpeed > 0 && downloadingRemaining > 0 ? Math.max(1, Math.round(downloadingRemaining / etaSpeed)) : null
     return { unfinished, active: this.activeCount(), activeConnections: this.slots.used, maxConnections: this.maxConnections, effectiveConnections: this.effectiveConnections, loadLevel: this.loadGovernor.level, siteThrottles: this.siteGovernor.snapshot().length, totalBytes, receivedBytes, speed, ...(etaSeconds === null ? {} : { etaSeconds }), top, tasks, largeFileBytes: this.largeFileBytes, largeFileMb: this.largeFileMb, minThreadBytes: this.minThreadBytes, minThreadMb: this.minThreadMb, minThreadEnabled: this.minThreadEnabled, agentAutonomy: this.agentAutonomy, autoThreads: this.autoThreads, fingerprintResume: this.fingerprintResume, silentEnabled: this.silentEnabled }
   }
 
@@ -1377,6 +1848,8 @@ class Downloader {
         task.lastModified = record.lastModified ?? ''
         task.createdAt = Number(record.createdAt) || Date.now()
         task.chunks = Array.isArray(record.chunks) ? record.chunks : []
+        // 续传时沿用原来的起步分片数，否则一个「显式 2 线程」的任务恢复后会被当成自动阶梯爬到 8。
+        task.planThreads = Number(record.planThreads) || task.chunks.length
         task.receivedBytes = task.chunks.reduce((sum, chunk) => sum + (Number(chunk.cursor) || 0), 0)
         task.progress = task.totalBytes > 0 ? Math.min(1, task.receivedBytes / task.totalBytes) : 0
         task.status = 'paused'
@@ -1645,6 +2118,7 @@ const TASK_SCHEMA = {
     speed: { type: 'integer' },
     etaSeconds: { type: 'integer' },
     threads: { type: 'integer' },
+    expandedChunks: { type: 'integer' },
     createdAt: { type: 'integer' },
     startedAt: { type: 'integer' },
     finishedAt: { type: 'integer' },
@@ -1690,7 +2164,7 @@ function makeTool(manager) {
   return {
     name: 'downloader',
     description:
-      '多线程（HTTP Range 分片）文件下载器，下载到 dsh Host 本机磁盘。action=add 需要 url，可选 directory/filename/threads；action=list 返回任务与进度（limit 默认 20，visibleInUi 表示是否在面板显示），任务带 remainingBytes 与 etaSeconds（预估剩余秒数）；用返回的 id 执行 pause/resume/cancel/remove；clean 清空已结束任务。下载在 Host 后台继续，不需要等待——不要反复 list 轮询；要等完成时用 list 的 waitSeconds（0..300，任务结束或超时后返回一次）或只查单个 id。小于静默阈值且开关开启时任务静默完成，不出现在面板和对话条，但工具 list 仍可见；需要强制显示时传 forceDisplay=true。可用 singleThread 指定单连接/分片；可选 doh=true 走 DoH 解析、github=true 把 GitHub Release 直链换成 API 资产链接；用户手动下载始终显示并多线程；其余下载由 Agent 控制或受阈值约束。并发上限 = 并发任务数 × 单任务线程数，全局连接数由用户设置（默认 16，范围 1..64），Agent 指定的 threads 同样受此约束。设备高负载时实际并发会被自动压低；同一站点的并发与聚合限速由站点风控策略单独控制（403/429/503 后自动降档），这两项都在用户设置里，Agent 无法关闭。',
+      '多线程（HTTP Range 分片）文件下载器，下载到 dsh Host 本机磁盘。action=add 需要 url，可选 directory/filename/threads；action=list 返回任务与进度（limit 默认 20，visibleInUi 表示是否在面板显示），任务带 remainingBytes 与 etaSeconds（预估剩余秒数）；用返回的 id 执行 pause/resume/cancel/remove；clean 清空已结束任务。下载在 Host 后台继续，不需要等待——不要反复 list 轮询；要等完成时用 list 的 waitSeconds（0..300，任务结束或超时后返回一次）或只查单个 id。小于静默阈值且开关开启时任务静默完成，不出现在面板和对话条，但工具 list 仍可见；需要强制显示时传 forceDisplay=true。可用 singleThread 指定单连接/分片；可选 doh=true 走 DoH 解析、github=true 把 GitHub Release 直链换成 API 资产链接；用户手动下载始终显示并多线程；其余下载由 Agent 控制或受阈值约束。并发上限 = 并发任务数 × 单任务线程数，全局连接数由用户设置（默认 16，范围 1..64），Agent 指定的 threads 同样受此约束。设备高负载时实际并发会被自动压低；同一站点的并发与聚合限速由站点风控策略单独控制（403/429/503 后自动降档），这两项都在用户设置里，Agent 无法关闭。自动模式下的并发会在下载过程中爬升：起步按大小阶梯（4/6/8），若每条连接都被限速、全局预算有空闲，就每 3 秒（起步阶段 1.2 秒）切出一段剩余区间加一条连接（每次最多 2 条），最多 8 条；先跑完的分片交还的连接会被立刻填上，收尾阶段也保持满并发（所以分片条数可能多于 8，但同时在用的连接不会超过 8）。已下载的字节原地保留，不需要重下。',
     parameters: TOOL_PARAMETERS,
     output: {
       schema: {
@@ -1980,6 +2454,7 @@ function makeProbeTool(manager) {
           filename: { type: 'string' },
           etag: { type: 'string' },
           lastModified: { type: 'string' },
+          resolvedUrl: { type: 'string' },
           error: { type: 'string' },
         },
       },
@@ -1995,7 +2470,14 @@ function makeProbeTool(manager) {
           : undefined
         try {
           const result = await probe(url, AbortSignal.timeout(60_000), sanitizeHeaders(input.headers), dispatcher)
-          return { ok: true, url, ...result }
+          // finalUrl 是内部字段：只在确实跳转过时以 resolvedUrl 暴露，便于诊断镜像/CDN。
+          const { finalUrl, ...rest } = result
+          return {
+            ok: true,
+            url,
+            ...(typeof finalUrl === 'string' && finalUrl !== '' && finalUrl !== url ? { resolvedUrl: finalUrl } : {}),
+            ...rest,
+          }
         } finally {
           // DoH 解析用的 Agent 是一次性的，不关会一直占着连接。
           dispatcher?.close?.()
@@ -2056,6 +2538,8 @@ function makeRoutes(manager) {
           dohProvider: manager.dohProvider,
           githubEnabled: manager.githubEnabled,
           settingsPath: manager.settingsPath,
+          // 面板整体 ETA 与输入框上方的进度条同源：都用平滑速度算出来的那一个。
+          etaSeconds: manager.summary().etaSeconds,
         })
       },
     },
@@ -2179,7 +2663,7 @@ export const inject = ['tools', 'webServer']
 
 /** 每次模型请求注入的简短公告；工具被 restrict 隐藏时自动消失。 */
 const TOOL_GUIDANCE =
-  '多线程下载器：需要把 http/https 文件下载到这台机器时，使用 downloader 工具（action=add 新建，list 查看进度，pause/resume 断点续传，cancel/remove 清理）。下载在 Host 后台进行，不必等待完成——不要反复调用 list 轮询；确实要等结果时用 list 的 waitSeconds（最多 300 秒，任务结束或超时后返回一次），或在需要时看一次任务上的 etaSeconds 预估剩余秒数。支持自定义请求头（Cookie/Referer/Authorization）、镜像回退、批量 URL、多算法校验、分片重试与全局限速；可选 DoH 解析与 GitHub 资产解析；小于静默阈值（默认 16 MB，可关闭，关闭后显示全部任务）的文件静默下载，不在面板和对话中显示；达到阈值的任务显示进度曲线；小于单线程阈值（默认 4 MB）的文件单连接下载，更大文件按大小自动 4/6/8 条连接（可显式指定 threads）。续传前与收尾都会用 ETag/Last-Modified 指纹复核，分片请求带 If-Range，远端换版本会自动从头重下。并发上限 = 并发任务数 × 单任务线程数，全局连接数由用户设置（默认 16，范围 1..64），Agent 指定的线程数同样受此约束、无法绕过；Host 还会按设备 CPU/内存负载自动收缩并发，并对触发风控的站点按站点降并发、加聚合限速（不同站点互不影响）。用户手动下载（面板填 URL/目录/线程）始终显示并多线程；其余下载视为 Agent 任务，受静默/单线程阈值约束，Agent 自主模式下可由 Agent 指定线程策略。本机 DNS 被污染或怀疑解析异常时，用同插件提供的 doh_lookup 直接走 DoH 解析（name 必填，type=both 同时取 A/AAAA，provider 可选）；下载前想确认大小、是否支持 Range、ETag 与 403 原因时用 http_probe（只发 HEAD/1 字节 Range，不下载正文）。这两个工具与 downloader 任务独立，不占连接配额。完整用法见 skill multithread-downloader。'
+  '多线程下载器：需要把 http/https 文件下载到这台机器时，使用 downloader 工具（action=add 新建，list 查看进度，pause/resume 断点续传，cancel/remove 清理）。下载在 Host 后台进行，不必等待完成——不要反复调用 list 轮询；确实要等结果时用 list 的 waitSeconds（最多 300 秒，任务结束或超时后返回一次），或在需要时看一次任务上的 etaSeconds 预估剩余秒数。支持自定义请求头（Cookie/Referer/Authorization）、镜像回退、批量 URL、多算法校验、分片重试与全局限速；可选 DoH 解析与 GitHub 资产解析；小于静默阈值（默认 16 MB，可关闭，关闭后显示全部任务）的文件静默下载，不在面板和对话中显示；达到阈值的任务显示进度曲线；小于单线程阈值（默认 4 MB）的文件单连接下载，更大文件按大小自动 4/6/8 条连接（可显式指定 threads），运行中若每条连接都被限速，并发会自动爬升到最多 8 条并在收尾时保持满并发（先跑完的分片把连接交还给还长的剩余区间；已下载字节保留，不必为提速重建任务）。续传前与收尾都会用 ETag/Last-Modified 指纹复核，分片请求带 If-Range，远端换版本会自动从头重下。并发上限 = 并发任务数 × 单任务线程数，全局连接数由用户设置（默认 16，范围 1..64），Agent 指定的线程数同样受此约束、无法绕过；Host 还会按设备 CPU/内存负载自动收缩并发，并对触发风控的站点按站点降并发、加聚合限速（不同站点互不影响）。用户手动下载（面板填 URL/目录/线程）始终显示并多线程；其余下载视为 Agent 任务，受静默/单线程阈值约束，Agent 自主模式下可由 Agent 指定线程策略。本机 DNS 被污染或怀疑解析异常时，用同插件提供的 doh_lookup 直接走 DoH 解析（name 必填，type=both 同时取 A/AAAA，provider 可选）；下载前想确认大小、是否支持 Range、ETag 与 403 原因时用 http_probe（只发 HEAD/1 字节 Range，不下载正文）。这两个工具与 downloader 任务独立，不占连接配额。完整用法见 skill multithread-downloader。'
 
 /** 注册给所有会话的技能正文（按需加载，不占常驻提示）。 */
 const SKILL_CONTENT = `# 多线程下载器（downloader）
@@ -2200,6 +2684,7 @@ const SKILL_CONTENT = `# 多线程下载器（downloader）
 - \`directory\` 可选，Host 本机绝对路径；省略则用插件默认目录（Known Folder / 用户 Downloads）。面板里点“选择…”：Electron 桌面环境使用系统原生目录对话框（标题“选择下载目录”）；其他环境使用插件内目录浏览器（同样标题，支持面包屑与选择当前目录）。
 - \`filename\` 可选，只写文件名，不要带路径分隔符。
 - \`threads\` 可选，1..16；省略时按大小自动（<32 MB 4 条、<256 MB 6 条、更大 8 条，可被 autoThreads 关闭），显式给出则固定；服务器不支持 Range 时自动回退单连接。所有任务共享并发限制数（默认 16，= 任务数 × 线程数），超出部分排队，Agent 无法绕过。
+- 并发会在下载中**爬升**（自动模式）：每条连接都被限速、且全局预算有空闲时，起步阶段每 1.2 秒、之后每 3 秒把一个分片的剩余区间对半切开、多起一条连接（每次最多 2 条），最多 8 条同时在用（显式指定 threads 时不爬升）。先跑完的分片会把连接交还回来，那一刻立刻把还长的剩余区间切一段给它，所以收尾阶段也是满并发（分片条数可能多于 8，连接数不会）。已下载字节原地保留，不会重下——所以**不需要**为提速而取消重建任务。
 - \`headers\` 可选对象：Cookie / Referer / Authorization 等；遇到 401/403 必须提供。
 - \`checksum\` 可选：\`{ algorithm, value }\`，algorithm 支持 md5/sha1/sha256/sha512/crc32，完成后校验，不匹配则任务失败。
 - \`sha256\` 可选：兼容旧参数，等价于 \`checksum: { algorithm: 'sha256', value }\`。
@@ -2388,4 +2873,4 @@ export function apply(ctx, config) {
 }
 
 /** 仅用于测试的纯函数导出；DSH 加载器会忽略额外命名导出。 */
-export const __test = { apply, makeTool, makeRoutes, TOOL_PARAMETERS, TASK_SCHEMA, sanitizeHeaders, retryDelay, RateLimiter, ConnectionSlots, probe, fetchWithRedirects, fileSha256, fileChecksum, normalizeChecksum, CHECKSUM_ALGORITHMS, freeDiskBytes, defaultDownloadDirectory, parseGithubReleaseUrl, normalizeDohProvider, DOH_PROVIDERS, autoThreadsForBytes, fingerprintChange, ifRangeValue, DownloadTask, Downloader, LoadGovernor, ResourceSampler, SiteGovernor, SiteLimiter, siteKeyForUrl, cpuPercentBetween, loadStepFor, httpStatusOf, SITE_LEVELS, RISK_STATUS, makeDohTool, makeProbeTool, resolverFor }
+export const __test = { apply, makeTool, makeRoutes, TOOL_PARAMETERS, TASK_SCHEMA, sanitizeHeaders, retryDelay, RateLimiter, ConnectionSlots, probe, fetchWithRedirects, fileSha256, fileChecksum, normalizeChecksum, CHECKSUM_ALGORITHMS, freeDiskBytes, defaultDownloadDirectory, parseGithubReleaseUrl, normalizeDohProvider, DOH_PROVIDERS, autoThreadsForBytes, fingerprintChange, ifRangeValue, DownloadTask, Downloader, LoadGovernor, ResourceSampler, SiteGovernor, SiteLimiter, siteKeyForUrl, cpuPercentBetween, loadStepFor, memoryPressurePercent, signedUrlExpiry, headersForRedirect, httpStatusOf, SITE_LEVELS, RISK_STATUS, makeDohTool, makeProbeTool, resolverFor }

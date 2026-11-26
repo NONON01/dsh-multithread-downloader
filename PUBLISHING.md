@@ -24,6 +24,19 @@
 - npm：`npm view dsh-multithread-downloader dist-tags` → `latest: 1.3.0`
 - Release 附件：`dsh-multithread-downloader-1.3.0.tgz`（与 npm tarball 同一份）
 
+已发布 `dsh-multithread-downloader@1.5.0`（2026-11-27），同时发布 GitHub Release `v1.5.0`：
+运行中并发爬升（起步 1.2s / 之后 3s 复核，最多 8 条连接，收尾保持满并发）、面板线程数改为真实并发，
+并带上此前未单独发布的 1.4.2 修复（内存缓存误判压并发、单次采样尖峰触发收缩、无 Range 任务永远下不完、
+Range 回 200 时先比对指纹、重定向后复用最终地址）。
+
+- npm：`npm view dsh-multithread-downloader dist-tags` → `latest: 1.5.0`
+- Release：<https://github.com/NONON01/dsh-multithread-downloader/releases/tag/v1.5.0>
+- Release 附件：`dsh-multithread-downloader-1.5.0.tgz`（与 npm tarball 同一份）
+- 注意：本次是用「绕过 2FA 的 granular token」发布的，npm 会先把版本放进处理队列
+  （`PUT` 返回 202、公开元数据短暂 404、重发报 `409 Cannot publish over previously staged version`）。
+  遇到 E409 不要重复发布，等传播完成再 `npm view` 观测；tarball 可能比元数据晚几分钟到几十分钟上线
+- 目录收录：`awesome-dsh-plugin/awesome-dsh-plugin#19140`、`0xsline/awesome-deepseek-harness#889`
+
 ## GitHub 仓库设置（About / Topics）
 
 这些是仓库页面上的字段，改一次就长期生效，也是 GitHub 站内搜索的入口。**需要用户确认后再改**。

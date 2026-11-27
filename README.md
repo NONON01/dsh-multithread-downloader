@@ -51,6 +51,7 @@ npm i dsh-multithread-downloader
 - HTTP Range 分片并发，服务器不支持 Range 时自动回退单连接
 - 断点续传：续传前与收尾都用 ETag / Last-Modified 指纹复核，分片请求带 `If-Range`，远端换版本自动从头重下
 - 分片指数退避重试（含 `Retry-After`）、请求超时、镜像回退、批量 URL（一次最多 20 个）
+- 停滞看门狗：连接半死却还在涓流（几 B/s）时，按窗口吞吐判定停滞并换一组连接，不消耗重试预算；两次仍极慢就标记「远端极慢」继续下，不判失败
 - 多算法校验：SHA-256 / SHA-512 / SHA-1 / MD5 / CRC32；下载前检查磁盘空间
 - 自定义请求头（Cookie / Referer / Authorization），401/403 直接告诉你缺什么
 
@@ -90,7 +91,7 @@ downloader({ action: 'pause', id: 'a1b2c3d4' })
 downloader({ action: 'resume', id: 'a1b2c3d4' })
 ```
 
-任务对象包含 `status`、`progress`、`speed`、`remainingBytes`、`etaSeconds`、`path`、`error`，静默任务也仍可用 `list` 查到。
+任务对象包含 `status`、`progress`、`speed`、`remainingBytes`、`etaSeconds`、`path`、`error`，静默任务也仍可用 `list` 查到。半死连接被看门狗换掉时会带上 `stallNote` 与 `stallResets`；判定「远端极慢」时 `slow: true` 且不再给 ETA。
 
 ## 面板与设置
 
@@ -161,6 +162,7 @@ npm pack --dry-run  # 确认 docs/ 未进包
 
 - 需要登录或防盗链的资源，必须显式提供 Cookie / Referer / Authorization
 - 自定义请求头会随未完成任务明文保存在 profile 目录，使用敏感 Cookie 时注意本机权限
+- 本地 `/api/mtd/*` 路由只接受 loopback + 同源请求（浏览器里打开的网页调用不到），细节与实测矩阵见 [SECURITY.md](SECURITY.md)
 - 跨域重定向会剥离 `Cookie`、`Authorization`、`Proxy-Authorization`
 - 指纹校验依赖源站返回 ETag / Last-Modified；都没有时只能按大小判断
 - 未完成任务重启后恢复为暂停状态；已完成文件保留

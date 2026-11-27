@@ -120,6 +120,9 @@ window.__ModuleLoader__.load({
       'settings.fingerprintResume': '续传指纹校验',
       'settings.fingerprintResumeHint': '续传前与收尾核对 ETag/Last-Modified，分片请求带 If-Range；远端换版本会自动从头重下',
       'settings.fingerprintResumeOffHint': '已关闭：只按文件大小判断，远端换版本可能拼出混合文件',
+      'settings.stallWatchdog': '停滞看门狗',
+      'settings.stallWatchdogHint': '连接半死却还在涓流（几 B/s）时，按窗口吞吐判定停滞并换一组连接；两次仍极慢就标记「远端极慢」，继续下而不判失败',
+      'settings.stallWatchdogOffHint': '已关闭：只靠 30 秒正文空闲超时，涓流连接会一直挂着',
       'settings.agentAutonomy': 'Agent 自主模式',
       'settings.agentAutonomyHint': '开启后阈值设置屏蔽但继续约束 Agent 任务；面板手动下载不受限制',
       'settings.title': '设置',
@@ -251,6 +254,9 @@ window.__ModuleLoader__.load({
       'settings.fingerprintResume': 'Resume fingerprint check',
       'settings.fingerprintResumeHint': 'Checks ETag/Last-Modified before resuming and at the end; chunk requests carry If-Range, and a changed remote file restarts the download',
       'settings.fingerprintResumeOffHint': 'Off: only the file size is compared, so a changed remote file can mix versions',
+      'settings.stallWatchdog': 'Stall watchdog',
+      'settings.stallWatchdogHint': 'When a connection is half-dead but still trickling a few bytes per second, the watchdog judges the window throughput, swaps in a fresh connection, and after two failed attempts marks the task "remote too slow" instead of failing it',
+      'settings.stallWatchdogOffHint': 'Off: only the 30s body idle timeout remains, so a trickling connection stays stuck',
       'settings.agentAutonomy': 'Agent autonomy',
       'settings.agentAutonomyHint': 'Threshold settings are masked but still govern agent tasks; manual panel downloads are unrestricted',
       'settings.title': 'Settings',
@@ -758,6 +764,9 @@ button:has(> span > .mtd-icon) { position: relative; }
             : null,
         h('div', { className: 'mtd-url', title: task.path || task.url }, task.path || task.url),
         task.status === 'failed' && task.error !== '' ? h('div', { className: 'mtd-task-error' }, task.error) : null,
+        typeof task.stallNote === 'string' && task.stallNote !== ''
+          ? h('div', { className: 'mtd-task-note' }, task.stallNote)
+          : null,
         task.fingerprint !== undefined && typeof task.fingerprint.note === 'string' && task.fingerprint.note !== ''
           ? h('div', { className: 'mtd-task-note' }, task.fingerprint.note)
           : null,
@@ -930,6 +939,7 @@ button:has(> span > .mtd-icon) { position: relative; }
       const [minThreadEnabled, setMinThreadEnabled] = React.useState(true)
       const [autoThreads, setAutoThreads] = React.useState(true)
       const [fingerprintResume, setFingerprintResume] = React.useState(true)
+      const [stallWatchdog, setStallWatchdog] = React.useState(true)
       const [agentAutonomy, setAgentAutonomy] = React.useState(false)
       const [dohEnabled, setDohEnabled] = React.useState(false)
       const [dohProvider, setDohProvider] = React.useState('alidns')
@@ -996,6 +1006,9 @@ button:has(> span > .mtd-icon) { position: relative; }
       React.useEffect(() => {
         if (meta !== null && meta.fingerprintResume !== undefined) setFingerprintResume(Boolean(meta.fingerprintResume))
       }, [meta === null ? undefined : meta.fingerprintResume])
+      React.useEffect(() => {
+        if (meta !== null && meta.stallWatchdog !== undefined) setStallWatchdog(Boolean(meta.stallWatchdog))
+      }, [meta === null ? undefined : meta.stallWatchdog])
       React.useEffect(() => {
         if (meta !== null && meta.agentAutonomy !== undefined) setAgentAutonomy(Boolean(meta.agentAutonomy))
       }, [meta === null ? undefined : meta.agentAutonomy])
@@ -1487,6 +1500,24 @@ button:has(> span > .mtd-icon) { position: relative; }
                       h('span', null, t('settings.fingerprintResume')),
                     ),
                     h('span', { className: 'mtd-setting-hint' }, fingerprintResume ? t('settings.fingerprintResumeHint') : t('settings.fingerprintResumeOffHint')),
+                  ),
+                  h(
+                    'div',
+                    { className: 'mtd-setting-row' },
+                    h(
+                      'label',
+                      { className: 'mtd-switch-row' },
+                      h(Toggle, {
+                        checked: stallWatchdog,
+                        label: t('settings.stallWatchdog'),
+                        onChange: (next) => {
+                          setStallWatchdog(next)
+                          void saveFlags({ stallWatchdog: next })
+                        },
+                      }),
+                      h('span', null, t('settings.stallWatchdog')),
+                    ),
+                    h('span', { className: 'mtd-setting-hint' }, stallWatchdog ? t('settings.stallWatchdogHint') : t('settings.stallWatchdogOffHint')),
                   ),
                 ),
                 settingGroup(

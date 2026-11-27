@@ -122,6 +122,17 @@ const DISK_MARGIN_BYTES = 32 * 1024 * 1024
  */
 const BODY_IDLE_TIMEOUT_MS = 30_000
 /**
+ * 停滞看门狗。正文空闲超时只管「一个字节都不来」；连接半死却还在涓流时
+ * （实测 4 B/s：速度 10 B/s、ETA 两天、状态一直是「下载中」）它永远不会触发。
+ * 这里改看窗口吞吐：一个窗口内收到的字节低于下限，就换一组新连接重试；
+ * 换两次仍旧如此就标记「远端极慢」，继续下载而不是判失败。
+ */
+const STALL_WINDOW_MS = 60_000
+const STALL_MIN_BYTES = 64 * 1024
+const STALL_MAX_RESETS = 2
+/** 低于这个速度不报 ETA：算出来的量级是「两天」，不如直说极慢。 */
+const SLOW_SPEED_BPS = 1024
+/**
  * 跟随重定向后的最终地址复用时长上限。
  * GitHub Release 资产走 api.github.com 时每次请求都会吃掉 60 次/小时的配额，
  * 而 302 指向的签名地址本身支持 Range、有效期约 1 小时，所以分片直接打它；
@@ -145,6 +156,15 @@ function numberConfig(value, fallback, min, max) {
 /** 并发限制数（连接数）收敛到合法区间。 */
 function clampConnections(value) {
   return numberConfig(value, DEFAULT_MAX_CONNECTIONS, 1, MAX_CONNECTIONS)
+}
+
+/** 给用户看的小体积数值（只有 KB / MB / GB 三档，够用了）。 */
+function formatBytesCompact(bytes) {
+  const value = Math.max(0, Number(bytes) || 0)
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${Math.round(value / 102.4) / 10} KB`
+  if (value < 1024 * 1024 * 1024) return `${Math.round(value / (1024 * 102.4)) / 10} MB`
+  return `${Math.round(value / (1024 * 1024 * 102.4)) / 10} GB`
 }
 
 /** 当前 profile 目录：优先环境变量，退回 ~/.dsh/profiles/<name>。 */
@@ -246,6 +266,14 @@ class DownloadTask {
     this.lastSample = 0
     this.lastSampleAt = 0
     this.history = []
+    /** 停滞看门狗：自动换连接的次数、是否已判定「远端极慢」、给用户看的说明。 */
+    this.stallResets = 0
+    this.stallSlow = false
+    this.stallNote = ''
+    /** 每次判定停滞就 +1：在途的分片发现它变了就主动取消，换一条新连接。 */
+    this.stallEpoch = 0
+    this.stallWindowAt = 0
+    this.stallWindowBytes = 0
   }
 
   get active() {
@@ -267,7 +295,9 @@ class DownloadTask {
     // 预估剩余时间：只在正在下载、速度有效、大小已知时给出，避免给出误导性的 0 或 Infinity。
     // 优先用平滑速度，秒级瞬时速度的抖动会让 ETA 每秒跳一次。
     const rate = this.etaSpeed > 0 ? this.etaSpeed : this.speed
-    const etaSeconds = this.status === 'downloading' && rate > 0 && remainingBytes > 0
+    // 速度低到 1 KB/s 以下时算出来的 ETA 是「两天」这种量级，报出来只会误导。
+    const tooSlow = rate > 0 && rate < SLOW_SPEED_BPS
+    const etaSeconds = this.status === 'downloading' && rate > 0 && remainingBytes > 0 && !tooSlow
       ? Math.max(1, Math.round(remainingBytes / rate))
       : null
     const snapshot = {
@@ -284,6 +314,9 @@ class DownloadTask {
       progress: this.totalBytes > 0 ? Math.min(1, this.receivedBytes / this.totalBytes) : 0,
       speed: this.speed,
       ...(etaSeconds === null ? {} : { etaSeconds }),
+      ...(tooSlow || this.stallSlow ? { slow: true } : {}),
+      ...(this.stallNote === '' ? {} : { stallNote: this.stallNote }),
+      ...(this.stallResets > 0 ? { stallResets: this.stallResets } : {}),
       threads: throttled === null
         ? live
         : Math.min(live, Math.max(1, throttled.cap)),
@@ -371,6 +404,9 @@ class DownloadTask {
     this.stopSampler()
     this.lastSample = this.receivedBytes
     this.lastSampleAt = Date.now()
+    // 暂停一段时间后恢复，窗口起点还是旧的会让看门狗把「暂停的那几分钟」算成停滞。
+    this.stallWindowAt = 0
+    this.stallWindowBytes = this.receivedBytes
     this.sampler = setInterval(() => {
       const now = Date.now()
       const elapsed = Math.max(1, now - this.lastSampleAt) / 1000
@@ -385,6 +421,7 @@ class DownloadTask {
       this.lastSample = bytes
       this.lastSampleAt = now
       this.progress = this.totalBytes > 0 ? Math.min(1, bytes / this.totalBytes) : 0
+      this.checkStall(now)
       this.recordHistory(now)
     }, 1000)
     this.sampler.unref?.()
@@ -692,6 +729,71 @@ class DownloadTask {
     if (live > this.peakConnections) this.peakConnections = live
   }
 
+  /** 此刻真正挂在连接上的分片数；0 表示在等连接槽或站点冷却，不是停滞。 */
+  inflightChunks() {
+    let live = 0
+    for (const chunk of this.chunks) {
+      if (chunk.inflight === true) live += 1
+    }
+    return live
+  }
+
+  /**
+   * 停滞看门狗的一次判定（每秒由采样器调用）。
+   * 只看窗口吞吐而不是「有没有字节」：半死连接每秒来几个字节，永远不会空闲超时。
+   */
+  checkStall(now) {
+    if (this.status !== 'downloading' || this.manager.stallWatchdog !== true) return
+    const windowMs = this.manager.stallWindowMs
+    if (!(windowMs > 0)) return
+    if (this.stallWindowAt === 0) {
+      this.stallWindowAt = now
+      this.stallWindowBytes = this.receivedBytes
+      return
+    }
+    if (now - this.stallWindowAt < windowMs) return
+    const gained = Math.max(0, this.receivedBytes - this.stallWindowBytes)
+    this.stallWindowAt = now
+    this.stallWindowBytes = this.receivedBytes
+    const floor = this.stallFloorBytes(windowMs)
+    if (gained >= floor) {
+      // 吞吐回来了：把之前的判定清掉，让面板不再挂着「极慢」。
+      this.stallNote = ''
+      this.stallSlow = false
+      return
+    }
+    // 没挂在连接上（排队/冷却）不算停滞；剩余量不足一个窗口也不必干预。
+    if (this.inflightChunks() === 0) return
+    if (this.totalBytes > 0 && this.totalBytes - this.receivedBytes < this.manager.stallMinBytes) return
+    if (this.stallSlow) return
+    if (this.stallResets >= this.manager.stallMaxResets) {
+      this.stallSlow = true
+      this.stallNote = `远端极慢：最近 ${Math.round(windowMs / 1000)} 秒只收到 ${formatBytesCompact(gained)}，已停止自动换连接`
+      return
+    }
+    this.stallResets += 1
+    this.stallEpoch += 1
+    this.stallNote = `检测到停滞（最近 ${Math.round(windowMs / 1000)} 秒只收到 ${formatBytesCompact(gained)}），正在换一组连接（${this.stallResets}/${this.manager.stallMaxResets}）`
+  }
+
+  /**
+   * 判停滞的字节下限。用户自己设的全局限速、或站点风控后的聚合限速，
+   * 本来就会把窗口吞吐压到很低——那不是停滞，先把下限按预期吞吐让下来。
+   */
+  stallFloorBytes(windowMs) {
+    const seconds = windowMs / 1000
+    let floor = this.manager.stallMinBytes
+    const limits = []
+    if (this.manager.rateLimitBytes > 0) limits.push(this.manager.rateLimitBytes)
+    const siteKey = siteKeyForUrl(this.currentUrl())
+    if (siteKey !== '') {
+      const site = this.manager.siteGovernor.sites.get(siteKey)
+      if (site !== undefined && site !== null && site.level > 0 && site.rateBytes > 0) limits.push(site.rateBytes)
+    }
+    if (limits.length > 0) floor = Math.min(floor, Math.min(...limits) * seconds * 0.5)
+    return Math.max(1, Math.round(floor))
+  }
+
   /** 分片数上限：自动阶梯可以爬到 ESCALATE_MAX_THREADS，显式指定的线程数保持固定。 */
   escalationTarget() {
     if (this.chunks.length === 0) return 1
@@ -878,6 +980,8 @@ class DownloadTask {
       }
       let slot = null
       let retry = false
+      /** 看门狗换连接是健康检查，不是退避：立刻重连，别再多等半秒。 */
+      let immediateRetry = false
       let retryAfterMs = 0
       let cooldownUrl = ''
       try {
@@ -924,7 +1028,17 @@ class DownloadTask {
         if (this.status !== 'downloading' || this.abort.signal.aborted) return
         const status = httpStatusOf(error)
         const timedOut = error?.name === 'AbortError' && !this.abort.signal.aborted
-        if (error?.code === 'TARGET_STALE') {
+        if (error?.code === 'STALL_RESET') {
+          // 看门狗换连接不算网络失败：不消耗重试预算、不退避，直接从当前游标重来。
+          // 多地址时顺便换一个镜像，半死的往往是某一条线路。
+          attempts = 0
+          retry = true
+          immediateRetry = true
+          if (this.urls.length > 1) {
+            this.urlIndex = (this.urlIndex + 1) % this.urls.length
+            this.forgetTarget()
+          }
+        } else if (error?.code === 'TARGET_STALE') {
           // 缓存的重定向地址过期：重新解析后再来。既不算站点风控，也不算网络失败。
           attempts += 1
           if (attempts >= MAX_ATTEMPTS) throw error
@@ -958,7 +1072,7 @@ class DownloadTask {
         const cooled = this.manager.siteGovernor.limiterFor(cooldownUrl)
         if (cooled !== null) await cooled.waitCooldown(this.abort.signal)
       }
-      if (retry) await sleep(retryDelay(attempts, retryAfterMs))
+      if (retry && !immediateRetry) await sleep(retryDelay(attempts, retryAfterMs))
     }
   }
 
@@ -1034,6 +1148,9 @@ class DownloadTask {
       if (response.body === null) throw new Error('响应没有正文')
       const reader = response.body.getReader()
       let cursor = position
+      // 看门狗判定停滞时会 +1；本轮请求发现它变了就主动放弃这条连接，
+      // 由 runChunk 立刻用新连接从当前游标续上（不会消耗网络重试预算）。
+      const stallEpoch = this.stallEpoch
       for (;;) {
         let step
         try {
@@ -1044,6 +1161,12 @@ class DownloadTask {
           throw error
         }
         const { done, value } = step
+        if (!done && this.stallEpoch !== stallEpoch) {
+          await reader.cancel().catch(() => {})
+          const stalled = new Error('停滞看门狗：换一组连接重试')
+          stalled.code = 'STALL_RESET'
+          throw stalled
+        }
         if (done) break
         if (this.runToken !== run || this.status !== 'downloading' || this.superseded) {
           await reader.cancel().catch(() => {})
@@ -1521,6 +1644,17 @@ class Downloader {
     this.limiter = new RateLimiter(this.rateLimitBytes)
     /** 分片正文空闲超时（毫秒）；测试可传小值，生产用默认 30 秒。 */
     this.ioIdleTimeoutMs = Number(options.ioIdleTimeoutMs) > 0 ? Number(options.ioIdleTimeoutMs) : BODY_IDLE_TIMEOUT_MS
+    /**
+     * 停滞看门狗：窗口内吞吐低于下限就换一组连接。默认开启；关掉后只剩
+     * 「正文空闲超时」这一层，涓流连接会一直挂着。测试可把窗口压到几百毫秒。
+     */
+    this.stallWatchdog = options.stallWatchdog !== false
+    this.stallWindowMs = Number(options.stallWindowMs) > 0 ? Number(options.stallWindowMs) : STALL_WINDOW_MS
+    this.stallWindowSec = Math.max(1, Math.round(this.stallWindowMs / 1000))
+    this.stallMinBytes = Number(options.stallMinBytes) > 0 ? Number(options.stallMinBytes) : STALL_MIN_BYTES
+    this.stallMaxResets = Number.isFinite(Number(options.stallMaxResets)) && Number(options.stallMaxResets) >= 0
+      ? Math.round(Number(options.stallMaxResets))
+      : STALL_MAX_RESETS
     this.dohEnabled = options.dohEnabled === true
     this.dohProvider = normalizeDohProvider(options.dohProvider)
     this.githubEnabled = options.githubEnabled === true
@@ -1656,7 +1790,7 @@ class Downloader {
         totalBytes: task.totalBytes,
         receivedBytes: task.receivedBytes,
         remainingBytes,
-        ...(task.status === 'downloading' && rate > 0 && remainingBytes > 0
+        ...(task.status === 'downloading' && rate >= SLOW_SPEED_BPS && remainingBytes > 0
           ? { etaSeconds: Math.max(1, Math.round(remainingBytes / rate)) }
           : {}),
       }
@@ -1672,7 +1806,7 @@ class Downloader {
       if (top === null || (top.status !== 'downloading' && task.status === 'downloading')) top = entry
     }
     // 聚合 ETA 用平滑速度：面板与输入框上方的进度条每秒刷新一次，瞬时速度会让「约剩」乱跳。
-    const etaSeconds = etaSpeed > 0 && downloadingRemaining > 0 ? Math.max(1, Math.round(downloadingRemaining / etaSpeed)) : null
+    const etaSeconds = etaSpeed >= SLOW_SPEED_BPS && downloadingRemaining > 0 ? Math.max(1, Math.round(downloadingRemaining / etaSpeed)) : null
     return { unfinished, active: this.activeCount(), activeConnections: this.slots.used, maxConnections: this.maxConnections, effectiveConnections: this.effectiveConnections, loadLevel: this.loadGovernor.level, siteThrottles: this.siteGovernor.snapshot().length, totalBytes, receivedBytes, speed, ...(etaSeconds === null ? {} : { etaSeconds }), top, tasks, largeFileBytes: this.largeFileBytes, largeFileMb: this.largeFileMb, minThreadBytes: this.minThreadBytes, minThreadMb: this.minThreadMb, minThreadEnabled: this.minThreadEnabled, agentAutonomy: this.agentAutonomy, autoThreads: this.autoThreads, fingerprintResume: this.fingerprintResume, silentEnabled: this.silentEnabled }
   }
 
@@ -1727,6 +1861,13 @@ class Downloader {
       )
     }
     if (input.githubEnabled !== undefined) this.githubEnabled = Boolean(input.githubEnabled)
+    if (input.stallWatchdog !== undefined) this.stallWatchdog = Boolean(input.stallWatchdog)
+    if (input.stallWindowSec !== undefined) {
+      const seconds = Math.round(Number(input.stallWindowSec))
+      if (!Number.isFinite(seconds) || seconds < 10 || seconds > 600) throw new Error('停滞判定窗口需为 10..600 秒')
+      this.stallWindowSec = seconds
+      this.stallWindowMs = seconds * 1000
+    }
     const persisted = this.persistSettings()
     return {
       largeFileBytes: bytes,
@@ -1746,6 +1887,8 @@ class Downloader {
       dohEnabled: this.dohEnabled,
       dohProvider: this.dohProvider,
       githubEnabled: this.githubEnabled,
+      stallWatchdog: this.stallWatchdog,
+      stallWindowSec: this.stallWindowSec,
       persisted,
       ...this.settingsPersistError === '' ? {} : { persistError: this.settingsPersistError },
     }
@@ -1771,6 +1914,8 @@ class Downloader {
         dohEnabled: this.dohEnabled,
         dohProvider: this.dohProvider,
         githubEnabled: this.githubEnabled,
+        stallWatchdog: this.stallWatchdog,
+        stallWindowSec: this.stallWindowSec,
       }, null, 2)
       const temporary = `${this.settingsPath}.tmp`
       writeFileSync(temporary, payload)
@@ -2117,6 +2262,9 @@ const TASK_SCHEMA = {
     progress: { type: 'number' },
     speed: { type: 'integer' },
     etaSeconds: { type: 'integer' },
+    slow: { type: 'boolean' },
+    stallNote: { type: 'string' },
+    stallResets: { type: 'integer' },
     threads: { type: 'integer' },
     expandedChunks: { type: 'integer' },
     createdAt: { type: 'integer' },
@@ -2537,6 +2685,8 @@ function makeRoutes(manager) {
           dohEnabled: manager.dohEnabled,
           dohProvider: manager.dohProvider,
           githubEnabled: manager.githubEnabled,
+          stallWatchdog: manager.stallWatchdog,
+          stallWindowSec: manager.stallWindowSec,
           settingsPath: manager.settingsPath,
           // 面板整体 ETA 与输入框上方的进度条同源：都用平滑速度算出来的那一个。
           etaSeconds: manager.summary().etaSeconds,
@@ -2663,7 +2813,7 @@ export const inject = ['tools', 'webServer']
 
 /** 每次模型请求注入的简短公告；工具被 restrict 隐藏时自动消失。 */
 const TOOL_GUIDANCE =
-  '多线程下载器：需要把 http/https 文件下载到这台机器时，使用 downloader 工具（action=add 新建，list 查看进度，pause/resume 断点续传，cancel/remove 清理）。下载在 Host 后台进行，不必等待完成——不要反复调用 list 轮询；确实要等结果时用 list 的 waitSeconds（最多 300 秒，任务结束或超时后返回一次），或在需要时看一次任务上的 etaSeconds 预估剩余秒数。支持自定义请求头（Cookie/Referer/Authorization）、镜像回退、批量 URL、多算法校验、分片重试与全局限速；可选 DoH 解析与 GitHub 资产解析；小于静默阈值（默认 16 MB，可关闭，关闭后显示全部任务）的文件静默下载，不在面板和对话中显示；达到阈值的任务显示进度曲线；小于单线程阈值（默认 4 MB）的文件单连接下载，更大文件按大小自动 4/6/8 条连接（可显式指定 threads），运行中若每条连接都被限速，并发会自动爬升到最多 8 条并在收尾时保持满并发（先跑完的分片把连接交还给还长的剩余区间；已下载字节保留，不必为提速重建任务）。续传前与收尾都会用 ETag/Last-Modified 指纹复核，分片请求带 If-Range，远端换版本会自动从头重下。并发上限 = 并发任务数 × 单任务线程数，全局连接数由用户设置（默认 16，范围 1..64），Agent 指定的线程数同样受此约束、无法绕过；Host 还会按设备 CPU/内存负载自动收缩并发，并对触发风控的站点按站点降并发、加聚合限速（不同站点互不影响）。用户手动下载（面板填 URL/目录/线程）始终显示并多线程；其余下载视为 Agent 任务，受静默/单线程阈值约束，Agent 自主模式下可由 Agent 指定线程策略。本机 DNS 被污染或怀疑解析异常时，用同插件提供的 doh_lookup 直接走 DoH 解析（name 必填，type=both 同时取 A/AAAA，provider 可选）；下载前想确认大小、是否支持 Range、ETag 与 403 原因时用 http_probe（只发 HEAD/1 字节 Range，不下载正文）。这两个工具与 downloader 任务独立，不占连接配额。完整用法见 skill multithread-downloader。'
+  '多线程下载器：需要把 http/https 文件下载到这台机器时，使用 downloader 工具（action=add 新建，list 查看进度，pause/resume 断点续传，cancel/remove 清理）。下载在 Host 后台进行，不必等待完成——不要反复调用 list 轮询；确实要等结果时用 list 的 waitSeconds（最多 300 秒，任务结束或超时后返回一次），或在需要时看一次任务上的 etaSeconds 预估剩余秒数。支持自定义请求头（Cookie/Referer/Authorization）、镜像回退、批量 URL、多算法校验、分片重试与全局限速；可选 DoH 解析与 GitHub 资产解析；小于静默阈值（默认 16 MB，可关闭，关闭后显示全部任务）的文件静默下载，不在面板和对话中显示；达到阈值的任务显示进度曲线；小于单线程阈值（默认 4 MB）的文件单连接下载，更大文件按大小自动 4/6/8 条连接（可显式指定 threads），运行中若每条连接都被限速，并发会自动爬升到最多 8 条并在收尾时保持满并发（先跑完的分片把连接交还给还长的剩余区间；已下载字节保留，不必为提速重建任务）。续传前与收尾都会用 ETag/Last-Modified 指纹复核，分片请求带 If-Range，远端换版本会自动从头重下。连接半死却还在涓流时会由停滞看门狗换一组连接（不消耗重试预算），任务会带上 stallNote；两次仍极慢则标记 slow 并继续下，不会失败——遇到这种情况不必取消重建。并发上限 = 并发任务数 × 单任务线程数，全局连接数由用户设置（默认 16，范围 1..64），Agent 指定的线程数同样受此约束、无法绕过；Host 还会按设备 CPU/内存负载自动收缩并发，并对触发风控的站点按站点降并发、加聚合限速（不同站点互不影响）。用户手动下载（面板填 URL/目录/线程）始终显示并多线程；其余下载视为 Agent 任务，受静默/单线程阈值约束，Agent 自主模式下可由 Agent 指定线程策略。本机 DNS 被污染或怀疑解析异常时，用同插件提供的 doh_lookup 直接走 DoH 解析（name 必填，type=both 同时取 A/AAAA，provider 可选）；下载前想确认大小、是否支持 Range、ETag 与 403 原因时用 http_probe（只发 HEAD/1 字节 Range，不下载正文）。这两个工具与 downloader 任务独立，不占连接配额。完整用法见 skill multithread-downloader。'
 
 /** 注册给所有会话的技能正文（按需加载，不占常驻提示）。 */
 const SKILL_CONTENT = `# 多线程下载器（downloader）
@@ -2757,6 +2907,7 @@ const SKILL_CONTENT = `# 多线程下载器（downloader）
 - **Agent 自主模式**：默认开启。开启后面板上的静默/单线程设置被屏蔽（数值保留，仍约束 Agent 任务）；Agent 可用 \`threads\` / \`singleThread\` 指定自己的策略。用户手动下载不受影响。
 - **DoH 解析**：面板开关，开启前有风险确认；可选 Cloudflare / AliDNS / Tencent。Agent 可用 \`doh\` / \`dohProvider\` 为单个任务启用。
 - **GitHub 模式**：Agent 用 \`github: true\` 把 Release 直链换成 API 资产链接，避免 github.com DNS 污染。
+- **停滞看门狗**（默认开）：连接半死却还在涓流（几 B/s）时，按窗口吞吐（默认 60 秒、64 KB 下限）判定停滞并换一组新连接，不消耗重试预算；换两次仍极慢就标记「远端极慢」（任务带 \`slow: true\`、不再给 ETA），继续下载而不判失败。限速跟随：用户设的全局限速与站点聚合限速会压低判定下限，不会误判。
 - 以上都是 Host 级设置，自动保存到 profile 目录下的 \`multithread-downloader.json\`，DSH 重启后恢复；\`cordis.patch.yml\` 只作为首次默认值。
 
 ## 界面
@@ -2806,6 +2957,8 @@ export function apply(ctx, config) {
     dohEnabled: config?.dohEnabled === true,
     dohProvider: normalizeDohProvider(config?.dohProvider),
     githubEnabled: config?.githubEnabled === true,
+    stallWatchdog: config?.stallWatchdog !== false,
+    stallWindowMs: numberConfig(config?.stallWindowSec, 60, 10, 600) * 1000,
     settingsPath,
     tasksPath,
   })

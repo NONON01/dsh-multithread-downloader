@@ -17,3 +17,5 @@
         maxConnections: 16
         loadAdaptive: true
         siteAdaptive: true
+        stallWatchdog: true
+        stallWindowSec: 60

@@ -8,3 +8,4 @@ Thumbs.db
 *.log
 # 仅本地开发文档，不随仓库/npm 发布
 docs/DEVELOPMENT.md
+docs/dev/

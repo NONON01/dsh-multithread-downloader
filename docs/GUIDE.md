@@ -759,7 +759,7 @@ npm test
 npm pack --dry-run
 ```
 
-测试覆盖（67 项，`test/host.test.mjs` 63 项 + `test/plugin.test.mjs` 4 项）：
+测试覆盖（79 项：`test/host.test.mjs` 69 项 + `test/plugin.test.mjs` 4 项 + `test/stall.test.mjs` 6 项）：
 
 - 请求头清洗、非法 header 名拒绝、跨域重定向剥离敏感头、探测/401 提示
 - 分片下载、4 MB 分段轮转、连接预算共享与排队、单任务不超预算
@@ -778,10 +778,13 @@ CI：GitHub Actions，Node 22 / 24，Linux / Windows / macOS。
 
 ## 版本与发布
 
-- 当前版本：**1.4.2**（本地已就绪，尚未发布）
-- npm：`latest = 1.4.1`（1.4.2 待发布）
-- GitHub Release：`v1.4.1`（v1.4.2 待发布）
+- 当前版本：**1.5.1**
+- npm：`latest = 1.5.1`
+- GitHub Release：`v1.5.1`（附件与 npm tarball 逐字节一致）
 - 历史版本：
+  - 1.5.1：停滞看门狗——连接半死还在涓流时换一组连接（不消耗重试预算），两次仍极慢标记 `slow` 继续下而不失败；开发文档按模块拆分
+  - 1.5.0：并发动态爬升到 8 条并在收尾保持满并发
+  - 1.4.x 及更早：见 `CHANGELOG.md`
   - 1.3.1：修复审查发现的问题（416 空转、任务恢复、原生目录选择器、暂停后立即恢复的竞态、正文空闲超时）
   - 1.3.0：多算法校验、`forceDisplay`、`http_probe`
   - 1.2.x：站点风控自适应与设备负载自适应
@@ -802,5 +805,6 @@ CI：GitHub Actions，Node 22 / 24，Linux / Windows / macOS。
 - `SECURITY.md`：安全说明
 - `PUBLISHING.md`：发布清单
 - `MARKETPLACE.md`：市场信息
+- `docs/DEVELOPMENT.md` + `docs/dev/`：开发文档（本地文档，不入库），索引与 16 册模块文档
 - `docs/screenshots/`：界面截图
 - `bin/picker.cs` / `bin/picker.exe`：Windows 目录选择器

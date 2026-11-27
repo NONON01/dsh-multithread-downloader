@@ -152,7 +152,7 @@ npm pack --dry-run  # 确认 docs/ 未进包
 
 `lib/*` 不依赖 DSH 上下文，其它插件可以直接 `import { doh, net, limits } from 'dsh-multithread-downloader/lib'`。
 
-开发文档见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)，完整使用说明见 [docs/GUIDE.md](docs/GUIDE.md)，安全见 [SECURITY.md](SECURITY.md)，发布见 [PUBLISHING.md](PUBLISHING.md)。
+开发文档是**本地文档**（不入库、不进 npm 包）：`docs/DEVELOPMENT.md` 是索引，各模块分册在 `docs/dev/`（架构、任务状态、下载流程、分片爬升、续传指纹、限速自适应、停滞看门狗、网络与 DoH、设置 schema、HTTP 路由、客户端、工具与提示词、测试、发布、已知限制、联动表）。完整使用说明见 [docs/GUIDE.md](docs/GUIDE.md)，安全见 [SECURITY.md](SECURITY.md)，发布见 [PUBLISHING.md](PUBLISHING.md)。
 
 ## 限制与非目标
 

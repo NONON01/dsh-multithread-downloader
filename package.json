@@ -66,7 +66,8 @@
   },
   "scripts": {
     "test": "node --test test/host.test.mjs test/plugin.test.mjs test/stall.test.mjs",
-    "pack:check": "npm pack --dry-run"
+    "pack:check": "npm pack --dry-run",
+    "doc:check": "node scripts/doccheck.mjs"
   },
   "repository": {
     "type": "git",

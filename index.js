@@ -34,6 +34,8 @@ import {
   httpStatusOf,
   ifRangeValue,
   isRetryable,
+  isHtmlContentType,
+  looksLikeHtmlBlock,
   parseGithubReleaseUrl,
   parseHttpUrl,
   probe,
@@ -41,6 +43,7 @@ import {
   retryDelay,
   sanitizeHeaders,
   signedUrlExpiry,
+  strongEtag,
 } from './lib/net.js'
 import { CHECKSUM_ALGORITHMS, fileChecksum, fileSha256, normalizeChecksum } from './lib/checksum.js'
 import {
@@ -51,6 +54,8 @@ import {
   RateLimiter,
   ResourceSampler,
   SITE_LEVELS,
+  SITE_DECAY_MS,
+  SITE_RISK_DEDUP_MS,
   SiteGovernor,
   SiteLimiter,
   cpuPercentBetween,
@@ -131,6 +136,13 @@ const DISK_MARGIN_BYTES = 32 * 1024 * 1024
  */
 const BODY_IDLE_TIMEOUT_MS = 30_000
 /**
+ * 短包风暴阈值：一次 Range 请求要了好几 MB，服务端却每次只回一小截。
+ * 少量来回是正常的（服务端喜欢按固定块回），连续这么多次只回不到 64 KB 就不正常了，
+ * 继续下去只是用几千个请求打远端。实测被代理吞掉 Range 时每次回 83 字节。
+ */
+const SHORT_STREAM_MIN_BYTES = 64 * 1024
+const SHORT_STREAM_LIMIT = 8
+/**
  * 停滞看门狗。正文空闲超时只管「一个字节都不来」；连接半死却还在涓流时
  * （实测 4 B/s：速度 10 B/s、ETA 两天、状态一直是「下载中」）它永远不会触发。
  * 这里改看窗口吞吐：一个窗口内收到的字节低于下限，就换一组新连接重试；
@@ -174,6 +186,41 @@ function formatBytesCompact(bytes) {
   if (value < 1024 * 1024) return `${Math.round(value / 102.4) / 10} KB`
   if (value < 1024 * 1024 * 1024) return `${Math.round(value / (1024 * 102.4)) / 10} MB`
   return `${Math.round(value / (1024 * 1024 * 102.4)) / 10} GB`
+}
+
+/**
+ * 解析 206 的 Content-Range：`bytes <start>-<end>/<total>`，总长未知时是 `*`。
+ * 解析不出来返回 null——调用方必须把「解析不出来」当成「无法验证区间」处理。
+ */
+function parseContentRange(raw) {
+  const match = /^\s*bytes\s+(\d+)-(\d+)\/(\d+|\*)\s*$/i.exec(String(raw ?? ''))
+  if (match === null) return null
+  const start = Number(match[1])
+  const end = Number(match[2])
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null
+  return { start, end, total: match[3] === '*' ? 0 : Number(match[3]) }
+}
+
+/** 目标本身是不是网页：是的话 HTML 正文就是正常内容，不能按软拦截处理。 */
+function isHtmlFilename(name) {
+  return /\.(?:html?|xhtml)$/i.test(String(name ?? ''))
+}
+
+/** 正文开头是不是 HTML 文档标记（拦截页、登录页、错误页都长这样）。 */
+function startsWithHtml(buffer) {
+  if (buffer === null || buffer === undefined || buffer.length === 0) return false
+  // 只看开头 64 字节：BOM 与空白之后仍以 <!doctype html / <html 开头就算。
+  const head = Buffer.from(buffer.subarray(0, Math.min(buffer.length, 64)))
+    .toString('latin1').replace(/^\uFEFF/, '').trimStart().toLowerCase()
+  return head.startsWith('<!doctype html') || head.startsWith('<html')
+}
+
+/** 正文是否以标记开头（`<`）。配合错误的 content-type 判定软拦截用。 */
+function startsWithMarkup(buffer) {
+  if (buffer === null || buffer === undefined || buffer.length === 0) return false
+  const head = Buffer.from(buffer.subarray(0, Math.min(buffer.length, 64)))
+    .toString('latin1').replace(/^\uFEFF/, '').trimStart()
+  return head.startsWith('<')
 }
 
 /** 当前 profile 目录：优先环境变量，退回 ~/.dsh/profiles/<name>。 */
@@ -600,7 +647,7 @@ class DownloadTask {
    * 记录一次站点风控。同一波并发分片会同时收到 403，这里按 2 秒窗口去重，
    * 让一波失败只降一档；返回 'exhausted' 表示该任务已经降无可降。
    */
-  registerSiteRisk(url, status) {
+  registerSiteRisk(url, status, reason = '') {
     const now = Date.now()
     if (now - this.lastRiskAt < 2000) return 'retry'
     if (this.riskRetries >= RISK_RETRY_LIMIT) return 'exhausted'
@@ -608,7 +655,8 @@ class DownloadTask {
     this.lastRiskAt = now
     const spec = this.manager.siteGovernor.penalize(url, status)
     if (spec !== null) {
-      this.riskNote = `HTTP ${status}：站点触发风控，已降至 ${spec.cap} 连接 / ${Math.round(spec.rate / 1024)} KB/s，冷却 ${Math.round(spec.cooldownMs / 1000)} 秒后继续（第 ${this.riskRetries} 次）`
+      const head = reason !== '' ? reason : `HTTP ${status}：站点触发风控`
+      this.riskNote = `${head}，已降至 ${spec.cap} 连接 / ${Math.round(spec.rate / 1024)} KB/s，冷却 ${Math.round(spec.cooldownMs / 1000)} 秒后继续（第 ${this.riskRetries} 次）`
     }
     return 'retry'
   }
@@ -1083,14 +1131,38 @@ class DownloadTask {
           attempts += 1
           if (attempts >= MAX_ATTEMPTS) throw error
           retry = true
-        } else if (status !== undefined && RISK_STATUS.has(status) && this.manager.siteAdaptive) {
-          // 站点风控：降档 + 冷却后再来，重试预算与网络重试分开计。
-          if (this.registerSiteRisk(url, status) === 'exhausted') {
-            throw new Error(`${describeHttpError(status)}（站点已限速重试 ${this.riskRetries} 次仍被拒绝）`)
+        } else if (error?.code === 'SOFT_BLOCKED') {
+          // 软拦截（HTTP 200/206 里的 HTML 拦截页）和 403 一样按站点风控处理：
+          // 降档、冷却、换镜像，重试几次仍然如此才报错，并说清真正的可能原因。
+          if (this.registerSiteRisk(url, 403, '远端返回 HTML 拦截页') === 'exhausted') {
+            throw new Error(
+              '远端返回的是 HTML 页面而不是文件正文（可能是 WAF 拦截页或登录页，'
+              + `已重试 ${this.riskRetries} 次）：请在 headers 里补充 Cookie / Referer，或稍后再试`,
+            )
           }
           cooldownUrl = url
           attempts = 0
           retry = true
+          if (this.urls.length > 1) {
+            this.urlIndex = (this.urlIndex + 1) % this.urls.length
+            this.forgetTarget()
+          }
+        } else if (error?.code === 'RANGE_MISMATCH' || error?.code === 'RANGE_OVERFLOW') {
+          // 服务端给的区间不可信（没有 Content-Range、起点错位、正文超长）。
+          // 这是协议层问题，不是网络抖动：直接交给收尾逻辑退回单连接整段下载，
+          // 那条路径从 0 读到 EOF，内容可验证。
+          throw error
+        } else if (status !== undefined && RISK_STATUS.has(status) && this.manager.siteAdaptive) {
+          // 站点风控：降档 + 冷却后再来，重试预算与网络重试分开计。
+          if (this.registerSiteRisk(url, status) === 'exhausted') {
+            throw new Error(`${describeHttpError(status)}（站点已降速重试 ${this.riskRetries} 次仍被拒绝；`
+              + '若浏览器能打开，请把 Cookie / Referer 通过 headers 传入）')
+          }
+          cooldownUrl = url
+          attempts = 0
+          retry = true
+          // 429 的 Retry-After 比站点档位里的冷却更长时，按服务端要求等。
+          retryAfterMs = Number(error?.retryAfterMs) || 0
         } else if (!timedOut && !isRetryable(error, status)) {
           throw error
         } else {
@@ -1112,8 +1184,30 @@ class DownloadTask {
         const cooled = this.manager.siteGovernor.limiterFor(cooldownUrl)
         if (cooled !== null) await cooled.waitCooldown(this.abort.signal)
       }
+      /**
+       * 无 Range（chunk.end < 0）的流式端点在重试时不能从游标续写：
+       * 服务端会从 0 重新发整份正文，写进 cursor 之后的位置就是错位文件。
+       * 这条路径没法「从中间续」，唯一安全的重试是从头来一遍。
+       */
+      if (retry && chunk.end < 0) await this.resetStreamRestart()
       if (retry && !immediateRetry) await sleep(retryDelay(attempts, retryAfterMs))
     }
+  }
+
+  /**
+   * 把无 Range 的单流从头重来：截断临时文件、游标归零。
+   * 只用于 chunk.end < 0 的分片——那条路径的正文总是从 0 开始，
+   * 保留游标续写会把第二遍的开头写到上一遍的中间，交付出错位文件。
+   */
+  async resetStreamRestart() {
+    if (this.handle !== null) await this.handle.truncate(0).catch(() => {})
+    for (const item of this.chunks) {
+      if (item.end < 0) item.cursor = 0
+    }
+    this.receivedBytes = 0
+    this.progress = 0
+    this.history = this.manager.shouldDisplay(this) ? [{ t: 0, p: 0, s: 0 }] : []
+    this.recent = []
   }
 
   /**
@@ -1122,7 +1216,8 @@ class DownloadTask {
    * 而错判成版本变化会让任务在「重开后仍然 200」的循环里失败。
    */
   remoteChanged(freshEtag, freshModified) {
-    if (freshEtag !== '' && this.etag !== '') return freshEtag !== this.etag
+    // 弱 ETag 的 `W/` 前缀不参与比较：W/"x" 与 "x" 是同一个版本，直接比字符串会误判成版本变化。
+    if (freshEtag !== '' && this.etag !== '') return strongEtag(freshEtag) !== strongEtag(this.etag)
     if (freshModified !== '' && this.lastModified !== '') return freshModified !== this.lastModified
     return false
   }
@@ -1164,7 +1259,21 @@ class DownloadTask {
         error.code = 'RANGE_UNSATISFIABLE'
         throw error
       }
-      if (!response.ok) throw httpErrorFor(response.status, response)
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => {})
+        throw httpErrorFor(response.status, response)
+      }
+      /**
+       * 软拦截识别：WAF / 登录页会用 200 或 206 回一份 HTML，长度还稳定。
+       * 只看状态码与大小的话，7 KB 的拦截页会被改名成 .exe 交付并标成 completed。
+       * 判据要两个信号同时成立才算（content-type 是 HTML 且正文以标记开头，
+       * 或者正文明确以 <!doctype html / <html 开头）：
+       * 有些站点把二进制也标成 text/html，单看响应头会误杀正常下载。
+       * 目标本身就是网页时（.html）不能这么判。
+       */
+      const expectedName = this.filename !== '' ? this.filename : filenameFromUrl(new URL(target.url))
+      const contentType = response.headers.get('content-type') ?? ''
+      const htmlTarget = isHtmlFilename(expectedName)
       if (pieceEnd >= 0 && response.status === 200) {
         await response.body?.cancel().catch(() => {})
         // 回 200 有两种原因：远端换了版本（If-Range 不匹配），或服务端根本不认 Range。
@@ -1185,9 +1294,43 @@ class DownloadTask {
         throw ignored
       }
       if (pieceEnd >= 0 && response.status !== 206) throw new Error(`HTTP ${response.status}`)
+      /**
+       * 206 必须自证「给的是我要的那一段」。只看状态码不看 Content-Range，
+       * 会让把整个文件从 0 重发的服务端把错位字节写进文件中间，而收尾的大小校验照样通过。
+       * 区间对不上、或者干脆没有 Content-Range 时，退回单连接整段下载：
+       * 那条路径从 0 开始读、以大小收尾，内容至少是可验证的。
+       */
+      if (pieceEnd >= 0) {
+        const range = parseContentRange(response.headers.get('content-range'))
+        const mismatch = range === null
+          || range.start !== position
+          || (range.end >= 0 && range.end < range.start)
+        if (mismatch) {
+          await response.body?.cancel().catch(() => {})
+          const error = new Error(range === null
+            ? 'HTTP 206 没有给出 Content-Range，无法确认返回的是请求的区间'
+            : `HTTP 206 返回区间错位：请求 ${position}-${pieceEnd}，实际 ${range.start}-${range.end}`)
+          error.code = 'RANGE_MISMATCH'
+          throw error
+        }
+        // 总长度变了说明远端换了版本（Content-Range 的总长比 ETag 更难被缓存篡改）。
+        if (range.total > 0 && this.totalBytes > 0 && range.total !== this.totalBytes) {
+          await response.body?.cancel().catch(() => {})
+          this.superseded = true
+          this.fingerprintState = 'changed'
+          this.fingerprintNote = '下载过程中远端文件已变化，已自动从头重新下载'
+          const changed = new Error('远端文件已变化（总长度与探测结果不一致）')
+          changed.code = 'FINGERPRINT_CHANGED'
+          throw changed
+        }
+      }
       if (response.body === null) throw new Error('响应没有正文')
       const reader = response.body.getReader()
       let cursor = position
+      // 严格按请求区间夹紧写入：多出来的字节绝不落盘（否则会覆盖下一个分片的数据）。
+      const writeLimit = pieceEnd >= 0
+        ? pieceEnd + 1
+        : (this.totalBytes > 0 ? this.totalBytes : Number.POSITIVE_INFINITY)
       // 看门狗判定停滞时会 +1；本轮请求发现它变了就主动放弃这条连接，
       // 由 runChunk 立刻用新连接从当前游标续上（不会消耗网络重试预算）。
       const stallEpoch = this.stallEpoch
@@ -1213,13 +1356,37 @@ class DownloadTask {
           return
         }
         if (this.handle === null) throw new Error('文件句柄已关闭')
+        // 首包特征：目标不是网页，却收到一份以 HTML 标记开头的正文 —— 这就是拦截页。
+        if (!htmlTarget && chunk.start === 0 && cursor === 0
+          && ((isHtmlContentType(contentType) && startsWithMarkup(value)) || startsWithHtml(value))) {
+          await reader.cancel().catch(() => {})
+          const blocked = new Error('远端返回的正文是 HTML 页面而不是文件内容（可能是 WAF 拦截页或登录页）')
+          blocked.code = 'SOFT_BLOCKED'
+          throw blocked
+        }
+        const room = writeLimit - cursor
+        if (room <= 0) {
+          // 服务端发的比它自己声明的区间还多：丢掉这条连接，别让它污染下一个分片。
+          await reader.cancel().catch(() => {})
+          const extra = new Error(`远端的正文超出请求区间（${position}-${pieceEnd}），已中止该连接`)
+          extra.code = 'RANGE_OVERFLOW'
+          throw extra
+        }
+        const slice = Math.min(value.length, room)
         // 站点聚合限速（风控后按站点生效）+ 全局限速，两者都要过。
-        if (site !== null) await site.limiter.take(value.length)
-        await this.manager.limiter.take(value.length)
-        await this.handle.write(value, 0, value.length, cursor)
-        cursor += value.length
+        // 都接受 abort：限速到 1 KB/s 时，已取消的任务不能攥着连接槽睡完整个等待。
+        if (site !== null) await site.limiter.take(slice, this.abort.signal)
+        await this.manager.limiter.take(slice, this.abort.signal)
+        // 限速等待可能覆盖了一次 pause/resume：等到真正落地时句柄可能已经属于新一轮，
+        // 继续写会把旧轮的字节写进新轮的文件里。
+        if (this.runToken !== run || this.status !== 'downloading' || this.handle === null) {
+          await reader.cancel().catch(() => {})
+          return
+        }
+        await this.handle.write(value, 0, slice, cursor)
+        cursor += slice
         chunk.cursor = cursor - chunk.start
-        this.receivedBytes += value.length
+        this.receivedBytes += slice
       }
       if (this.runToken !== run || this.status !== 'downloading') return
       // 单连接整段下载或已读满本段：正常结束；有进展但没读满则回到循环继续要剩余部分。
@@ -1227,6 +1394,26 @@ class DownloadTask {
         // 无 Range 模式没法从中间续传，正文短了只能报错，重试会拼出重复内容。
         if (this.totalBytes > 0 && cursor < this.totalBytes) throw new Error('连接提前结束：远端未发完整文件')
         return
+      }
+      /**
+       * 短包风暴保护：服务端每次只回几十字节、却对每个 Range 请求都回 206 时，
+       * 分片循环会一直「有进展」，既不触发重试也不触发超时，用几千个请求慢慢打远端。
+       * 连续多次只给一小截就判定它不可用，交给失败处理（并带上可操作的说明）。
+       */
+      const requested = pieceEnd - position + 1
+      const delivered = cursor - position
+      if (delivered > 0 && delivered < requested && delivered < SHORT_STREAM_MIN_BYTES) {
+        this.shortBursts = (Number(this.shortBursts) || 0) + 1
+        if (this.shortBursts >= SHORT_STREAM_LIMIT) {
+          const error = new Error(
+            `远端对每个 Range 请求只回 ${delivered} 字节（连续 ${this.shortBursts} 次），`
+            + '疑似代理/网关没有真正转发区间请求；已停止连续请求，请稍后重试或换镜像',
+          )
+          error.code = 'SHORT_STREAM'
+          throw error
+        }
+      } else if (delivered > 0) {
+        this.shortBursts = 0
       }
       if (cursor > pieceEnd || cursor > position) return
       throw new Error('连接提前结束')
@@ -1436,10 +1623,17 @@ class DownloadTask {
         await this.restartSingleStream()
         return
       }
+      // 区间不可信或远端只回短包：都说明「分片 + Range」这条路走不通，
+      // 退回单连接整段下载（从 0 读到 EOF，大小与指纹都可验证）。
+      if ((failed?.code === 'RANGE_MISMATCH' || failed?.code === 'RANGE_OVERFLOW' || failed?.code === 'SHORT_STREAM')
+        && !this.rangeFallback) {
+        await this.restartSingleStream()
+        return
+      }
       this.fail(failed)
       return
     }
-    await this.finalize()
+    await this.finalize(run)
   }
 
   /**
@@ -1457,7 +1651,21 @@ class DownloadTask {
       this.runChunk(chunk, run).then(
         () => undefined,
         (error) => {
-          if (failure === null) failure = error
+          if (failure === null) {
+            failure = error
+            // 首个致命失败立刻停掉其它分片：否则剩下的连接会陪着一个已经没救的分片
+            // 把整个文件跑完（实测一个分片 404 后，任务还在另一条连接上多跑了 4 秒）。
+            // 需要重启整轮的失败码除外——它们由收尾逻辑接管，abort 反而会让重启当场失败。
+            const restartable = ['FINGERPRINT_CHANGED', 'RANGE_MISMATCH', 'RANGE_OVERFLOW', 'SHORT_STREAM',
+              'RANGE_UNSATISFIABLE', 'RANGE_IGNORED'].includes(error?.code)
+            if (!restartable && this.status === 'downloading') {
+              try {
+                this.abort.abort()
+              } catch {
+                // 已经 abort 过：没有副作用。
+              }
+            }
+          }
         },
       ).finally(() => {
         chunk.running = false
@@ -1510,18 +1718,28 @@ class DownloadTask {
     this.fingerprintState = 'verified'
   }
 
-  async finalize() {
+  /**
+   * 收尾。从头到尾都要复查令牌与状态：收尾里的每一步都要等 IO
+   * （stat、收尾探测、校验和、rename），期间用户完全可能 pause/cancel。
+   * 不复查的话，一个在 checksum 期间被暂停的任务最后会被写成 completed。
+   */
+  async finalize(run) {
+    const stale = () => (run !== undefined && this.runToken !== run) || this.status !== 'downloading'
     if (this.handle === null) throw new Error('文件句柄已关闭')
     const info = await this.handle.stat()
+    if (stale()) return
     await this.handle.close()
     this.handle = null
+    if (stale()) return
     if (this.totalBytes > 0 && info.size !== this.totalBytes) {
       throw new Error(`文件大小不符：期望 ${this.totalBytes}，实际 ${info.size}`)
     }
     await this.verifyFinalFingerprint()
+    if (stale()) return
     if (this.checksum !== null) {
       const spec = CHECKSUM_ALGORITHMS[this.checksum.algorithm]
       const actual = await fileChecksum(this.partPath, this.checksum.algorithm)
+      if (stale()) return
       if (actual !== this.checksum.value) {
         throw new Error(`${spec?.label ?? this.checksum.algorithm} 不匹配：期望 ${this.checksum.value}，实际 ${actual}`)
       }
@@ -1620,8 +1838,23 @@ class DownloadTask {
           }
           await handle.truncate(this.totalBytes)
           await handle.close()
-          this.chunks = this.chunks.map((chunk) => ({ ...chunk, cursor: 0 }))
-          this.receivedBytes = 0
+          /**
+           * 失败后重试沿用已下载的游标：临时文件是位置写入的，已完成的字节仍然有效，
+           * 从头重下等于把几个小时都丢掉。真正需要归零的只有「无 Range 单流」那条路径
+           * ——它的正文总是从 0 开始，游标失去意义。
+           */
+          if (this.chunks.some((chunk) => chunk.end < 0)) {
+            this.chunks = this.chunks.map((chunk) => ({ ...chunk, cursor: 0 }))
+            this.receivedBytes = 0
+          } else {
+            this.receivedBytes = this.chunks.reduce((sum, chunk) => sum + (Number(chunk.cursor) || 0), 0)
+          }
+          // 失败遗留的「极慢/已换过连接」标记要清掉，否则看门狗在重试里永久失效。
+          this.stallResets = 0
+          this.stallSlow = false
+          this.stallNote = ''
+          this.stallWindowAt = 0
+          this.stallWindowBytes = 0
           await this.runChunks()
         } catch (error) {
           this.fail(error)
@@ -1875,6 +2108,23 @@ class Downloader {
     if (!Number.isFinite(minThreadBytes) || minThreadBytes < 0 || minThreadBytes > 10 * 1024 * 1024 * 1024) {
       throw new Error('单线程阈值需为 0..10 GB')
     }
+    /**
+     * 先把后面几个还要校验的字段全部验证完，再开始改内存状态。
+     * 否则「静默阈值已生效、并发数报错」会留下一个半生效的设置：
+     * 面板显示新值、磁盘里还是旧值，刷新后又跳回去。
+     */
+    const rate = input.rateLimitBytes === undefined ? null : Math.round(Number(input.rateLimitBytes))
+    if (rate !== null && (!Number.isFinite(rate) || rate < 0 || rate > 1024 * 1024 * 1024)) {
+      throw new Error('限速需为 0..1 GB/s')
+    }
+    const concurrency = input.maxConnections === undefined ? null : Math.round(Number(input.maxConnections))
+    if (concurrency !== null && (!Number.isFinite(concurrency) || concurrency < 1 || concurrency > MAX_CONNECTIONS)) {
+      throw new Error(`并发限制数需为 1..${MAX_CONNECTIONS}`)
+    }
+    const stallSeconds = input.stallWindowSec === undefined ? null : Math.round(Number(input.stallWindowSec))
+    if (stallSeconds !== null && (!Number.isFinite(stallSeconds) || stallSeconds < 10 || stallSeconds > 600)) {
+      throw new Error('停滞判定窗口需为 10..600 秒')
+    }
     this.largeFileBytes = bytes
     this.largeFileMb = Math.round(bytes / (1024 * 1024))
     this.minThreadBytes = minThreadBytes
@@ -1884,17 +2134,11 @@ class Downloader {
     if (input.autoThreads !== undefined) this.autoThreads = Boolean(input.autoThreads)
     if (input.fingerprintResume !== undefined) this.fingerprintResume = Boolean(input.fingerprintResume)
     if (input.silentEnabled !== undefined) this.silentEnabled = Boolean(input.silentEnabled)
-    if (input.rateLimitBytes !== undefined) {
-      const rate = Math.round(Number(input.rateLimitBytes))
-      if (!Number.isFinite(rate) || rate < 0 || rate > 1024 * 1024 * 1024) throw new Error('限速需为 0..1 GB/s')
+    if (rate !== null) {
       this.rateLimitBytes = rate
       this.limiter.setRate(rate)
     }
-    if (input.maxConnections !== undefined) {
-      const concurrency = Math.round(Number(input.maxConnections))
-      if (!Number.isFinite(concurrency) || concurrency < 1 || concurrency > MAX_CONNECTIONS) {
-        throw new Error(`并发限制数需为 1..${MAX_CONNECTIONS}`)
-      }
+    if (concurrency !== null) {
       this.maxConnections = concurrency
       // 用户设定的是上限；实际预算仍由设备负载决定。
       this.applyConnectionBudget(this.loadGovernor.setBase(concurrency))
@@ -1909,11 +2153,9 @@ class Downloader {
     }
     if (input.githubEnabled !== undefined) this.githubEnabled = Boolean(input.githubEnabled)
     if (input.stallWatchdog !== undefined) this.stallWatchdog = Boolean(input.stallWatchdog)
-    if (input.stallWindowSec !== undefined) {
-      const seconds = Math.round(Number(input.stallWindowSec))
-      if (!Number.isFinite(seconds) || seconds < 10 || seconds > 600) throw new Error('停滞判定窗口需为 10..600 秒')
-      this.stallWindowSec = seconds
-      this.stallWindowMs = seconds * 1000
+    if (stallSeconds !== null) {
+      this.stallWindowSec = stallSeconds
+      this.stallWindowMs = stallSeconds * 1000
     }
     const persisted = this.persistSettings()
     return {
@@ -2649,6 +2891,8 @@ function makeProbeTool(manager) {
           filename: { type: 'string' },
           etag: { type: 'string' },
           lastModified: { type: 'string' },
+          contentType: { type: 'string' },
+          warning: { type: 'string' },
           resolvedUrl: { type: 'string' },
           error: { type: 'string' },
         },
@@ -2667,11 +2911,17 @@ function makeProbeTool(manager) {
           const result = await probe(url, AbortSignal.timeout(60_000), sanitizeHeaders(input.headers), dispatcher)
           // finalUrl 是内部字段：只在确实跳转过时以 resolvedUrl 暴露，便于诊断镜像/CDN。
           const { finalUrl, ...rest } = result
+          const name = rest.filename !== '' ? rest.filename : filenameFromUrl(new URL(url))
+          // 目标不是网页却回 text/html：几乎总是 WAF 拦截页或登录页，提前说明比下完再报错好。
+          const warning = looksLikeHtmlBlock(rest.contentType, name)
+            ? '响应类型是 text/html：目标不是网页时这通常是被 WAF 拦截或需要登录，正文是拦截页而不是文件；请检查 headers（Cookie / Referer）'
+            : ''
           return {
             ok: true,
             url,
             ...(typeof finalUrl === 'string' && finalUrl !== '' && finalUrl !== url ? { resolvedUrl: finalUrl } : {}),
             ...rest,
+            ...(warning !== '' ? { warning } : {}),
           }
         } finally {
           // DoH 解析用的 Agent 是一次性的，不关会一直占着连接。
@@ -3073,4 +3323,4 @@ export function apply(ctx, config) {
 }
 
 /** 仅用于测试的纯函数导出；DSH 加载器会忽略额外命名导出。 */
-export const __test = { apply, makeTool, makeRoutes, TOOL_PARAMETERS, TASK_SCHEMA, sanitizeHeaders, retryDelay, RateLimiter, ConnectionSlots, probe, fetchWithRedirects, fileSha256, fileChecksum, normalizeChecksum, CHECKSUM_ALGORITHMS, freeDiskBytes, defaultDownloadDirectory, parseGithubReleaseUrl, normalizeDohProvider, DOH_PROVIDERS, autoThreadsForBytes, fingerprintChange, ifRangeValue, DownloadTask, Downloader, LoadGovernor, ResourceSampler, SiteGovernor, SiteLimiter, siteKeyForUrl, cpuPercentBetween, loadStepFor, memoryPressurePercent, signedUrlExpiry, headersForRedirect, httpStatusOf, SITE_LEVELS, RISK_STATUS, makeDohTool, makeProbeTool, resolverFor }
+export const __test = { apply, makeTool, makeRoutes, TOOL_PARAMETERS, TASK_SCHEMA, sanitizeHeaders, retryDelay, RateLimiter, ConnectionSlots, probe, fetchWithRedirects, fileSha256, fileChecksum, normalizeChecksum, CHECKSUM_ALGORITHMS, freeDiskBytes, defaultDownloadDirectory, parseGithubReleaseUrl, normalizeDohProvider, DOH_PROVIDERS, autoThreadsForBytes, fingerprintChange, ifRangeValue, DownloadTask, Downloader, LoadGovernor, ResourceSampler, SiteGovernor, SiteLimiter, siteKeyForUrl, cpuPercentBetween, loadStepFor, memoryPressurePercent, signedUrlExpiry, headersForRedirect, httpStatusOf, SITE_LEVELS, RISK_STATUS, SITE_RISK_DEDUP_MS, SITE_DECAY_MS, makeDohTool, makeProbeTool, resolverFor }

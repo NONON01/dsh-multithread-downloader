@@ -13,7 +13,7 @@ const {
   normalizeChecksum, parseGithubReleaseUrl, normalizeDohProvider, autoThreadsForBytes,
   fingerprintChange, ifRangeValue, DownloadTask, Downloader, LoadGovernor, SiteGovernor, SiteLimiter,
   siteKeyForUrl, cpuPercentBetween, loadStepFor, memoryPressurePercent, signedUrlExpiry, headersForRedirect,
-  httpStatusOf, SITE_LEVELS, RISK_STATUS, makeDohTool, makeProbeTool,
+  httpStatusOf, SITE_LEVELS, RISK_STATUS, SITE_RISK_DEDUP_MS, SITE_DECAY_MS, makeDohTool, makeProbeTool,
 } = __test
 
 const MB = 1024 * 1024
@@ -724,7 +724,7 @@ test('SiteLimiter escalates on risk signals and recovers after enough successes'
   assert.equal(site.level, 1)
   assert.equal(first.cap, SITE_LEVELS[1].cap)
   assert.ok(site.notBefore >= 1000 + SITE_LEVELS[1].cooldownMs)
-  const second = site.penalize(429, 2000)
+  const second = site.penalize(429, 1000 + SITE_RISK_DEDUP_MS + 1)
   assert.equal(site.level, 2)
   assert.ok(second.rate < first.rate)
   // 连续成功达到阈值才回落一档
@@ -740,7 +740,7 @@ test('SiteLimiter walks the whole recovery ramp from the deepest level', () => {
   const site = new SiteLimiter('example.com')
   const deepest = SITE_LEVELS.length - 1
   // 连续命中风控升到最深档，但不会越过最后一档。
-  for (let hit = 0; hit < 10; hit += 1) site.penalize(429, 1000 + hit)
+  for (let hit = 0; hit < 10; hit += 1) site.penalize(429, 1000 + hit * (SITE_RISK_DEDUP_MS + 1))
   assert.equal(site.level, deepest)
   assert.equal(site.cap, SITE_LEVELS[deepest].cap)
   assert.equal(site.rateBytes, SITE_LEVELS[deepest].rate)
@@ -767,13 +767,13 @@ test('SiteLimiter walks the whole recovery ramp from the deepest level', () => {
 
 test('SiteGovernor keeps each site policy independent', () => {
   const governor = new SiteGovernor(true)
-  governor.penalize('https://a.example.com/1', 403)
+  governor.penalize('https://a.example.com/1', 403, 1000)
   assert.equal(governor.sites.get('example.com').level, 1)
   assert.equal(governor.sites.has('other.org'), false)
   const other = governor.limiterFor('https://other.org/file')
   assert.equal(other.level, 0)
-  // 同一站点不同页面共用同一档位
-  governor.penalize('https://example.com/page-2', 403)
+  // 同一站点不同页面共用同一档位（隔开去重窗口，算两次独立信号）
+  governor.penalize('https://example.com/page-2', 403, 1000 + SITE_RISK_DEDUP_MS + 1)
   assert.equal(governor.sites.get('example.com').level, 2)
   assert.equal(governor.snapshot().length, 1)
   // 关闭站点自适应后清空
@@ -877,7 +877,7 @@ test('567 (EdgeOne WAF) counts as a site risk signal', async () => {
   assert.ok(RISK_STATUS.has(567), '567 must be a risk status, otherwise a real WAF block never downgrades the site')
   const manager = stubManager(tmpdir())
   const site = manager.siteGovernor.limiterFor('https://drivers.amd.com/drivers/file.exe')
-  const spec = site.penalize(567, 1000)
+  const spec = site.penalize(567, Date.now())
   assert.equal(site.level, 1)
   assert.equal(spec.cap, SITE_LEVELS[1].cap)
   assert.equal(manager.siteGovernor.snapshot()[0].level, 1)
@@ -942,6 +942,327 @@ test('a persistent 567 fails fast with an actionable message', async () => {
     assert.match(task.error, /HTTP 567/)
     assert.match(task.error, /WAF|安全策略/)
     assert.ok(Date.now() - started < 5000, 'a WAF block must not sit in a retry loop')
+  } finally {
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('two risk signals inside one window raise the site only one level, and an idle site decays', () => {
+  const site = new SiteLimiter('example.com')
+  site.penalize(403, 1000)
+  assert.equal(site.level, 1)
+  // 同一波并发分片同时撞墙：2 秒内重复上报只记录信号，不再升档。
+  site.penalize(403, 1400)
+  site.penalize(403, 1900)
+  assert.equal(site.level, 1, 'a burst of parallel 403s must not walk the site to the deepest level')
+  assert.equal(site.signals, 3)
+  // 出了窗口才算新的一次风控。
+  site.penalize(403, 4000)
+  assert.equal(site.level, 2)
+  // 长时间没有新信号：按空闲时间回升一档，而不是永久停在最低档。
+  assert.equal(site.decay(4000 + SITE_DECAY_MS + 1), true)
+  assert.equal(site.level, 1)
+})
+
+test('a weak ETag is the same version as its strong form', () => {
+  assert.equal(fingerprintChange({ etag: 'W/"abc"' }, { etag: '"abc"' }), '')
+  assert.equal(fingerprintChange({ etag: '"abc"' }, { etag: '"def"' }), 'etag')
+})
+
+test('a WAF HTML page served with 200 never becomes the delivered file', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-softblock-'))
+  const page = Buffer.from('<!doctype html><title>Blocked</title><p>Access denied by WAF</p>', 'utf8')
+  const { server, port } = await listen((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, {
+        'content-length': String(page.length),
+        'accept-ranges': 'bytes',
+        'content-type': 'text/html; charset=utf-8',
+      }).end()
+      return
+    }
+    // 200 状态的拦截页：状态码、长度、Range 支持全都“正常”，只有正文是 HTML。
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(page)
+  })
+  try {
+    const manager = stubManager(directory, { siteAdaptive: false })
+    const task = makeTask(manager, `http://127.0.0.1:${port}/driver.exe`, { singleThread: true })
+    task.status = 'probing'
+    await task.run().catch(() => {})
+    assert.equal(task.status, 'failed', 'an HTML block page must never be reported as completed')
+    assert.match(task.error, /HTML/)
+    assert.match(task.error, /Cookie|拦截/)
+  } finally {
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a 200 HTML block page without a content-type is caught by the body', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-softblock2-'))
+  const page = Buffer.from('<html><body>Please verify you are human</body></html>', 'utf8')
+  const { server, port } = await listen((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-length': String(page.length), 'accept-ranges': 'bytes' }).end()
+      return
+    }
+    res.writeHead(200, { 'content-length': String(page.length) }).end(page)
+  })
+  try {
+    const manager = stubManager(directory, { siteAdaptive: false })
+    const task = makeTask(manager, `http://127.0.0.1:${port}/setup.msi`, { singleThread: true })
+    task.status = 'probing'
+    await task.run().catch(() => {})
+    assert.equal(task.status, 'failed')
+    assert.match(task.error, /HTML/)
+  } finally {
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a 206 whose Content-Range says a different offset never corrupts the file', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-range-'))
+  const body = Buffer.alloc(3 * 1024 * 1024, 9)
+  const { server, port } = await listen((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-length': String(body.length), 'accept-ranges': 'bytes' }).end()
+      return
+    }
+    const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '')
+    if (range === null) {
+      // 退回单连接后没有 Range 头：正常整段发送。
+      res.writeHead(200, { 'content-length': String(body.length) }).end(body)
+      return
+    }
+    const start = Number(range[1])
+    // 关键：声称给的是请求区间，但正文永远从 0 开始（真机上见过这种代理）。
+    const length = Math.min(1024 * 1024, body.length)
+    res.writeHead(206, {
+      'content-length': String(length),
+      'content-range': `bytes ${start}-${start + length - 1}/${body.length}`,
+    }).end(body.subarray(0, length))
+  })
+  try {
+    const manager = stubManager(directory)
+    const task = makeTask(manager, `http://127.0.0.1:${port}/big.bin`, { threads: 2, threadsExplicit: true })
+    task.status = 'probing'
+    await task.run().catch(() => {})
+    // 错位字节绝不能落到文件里：要么退回单连接拿到正确内容，要么明确失败。
+    if (task.status === 'completed') {
+      assert.deepEqual(await readFile(task.path), body)
+      assert.equal(task.rangeFallback, true)
+    } else {
+      assert.equal(task.status, 'failed')
+    }
+  } finally {
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a 206 that ignores the requested offset falls back to one correct stream', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-range2-'))
+  const body = Buffer.alloc(2 * 1024 * 1024, 3)
+  const { server, port } = await listen((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-length': String(body.length), 'accept-ranges': 'bytes' }).end()
+      return
+    }
+    const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '')
+    if (range === null) {
+      res.writeHead(200, { 'content-length': String(body.length) }).end(body)
+      return
+    }
+    const start = Number(range[1])
+    const end = range[2] === '' ? body.length - 1 : Math.min(Number(range[2]), body.length - 1)
+    if (start === 0) {
+      res.writeHead(206, {
+        'content-length': String(end - start + 1),
+        'content-range': `bytes ${start}-${end}/${body.length}`,
+      }).end(body.subarray(start, end + 1))
+      return
+    }
+    // 起点错位：声明正确区间，但从 0 开始回。
+    res.writeHead(206, {
+      'content-length': String(end - start + 1),
+      'content-range': 'bytes 0-0/' + body.length,
+    }).end(body.subarray(0, end - start + 1))
+  })
+  try {
+    const manager = stubManager(directory)
+    const task = makeTask(manager, `http://127.0.0.1:${port}/file.bin`, { threads: 2, threadsExplicit: true })
+    task.status = 'probing'
+    await task.run().catch(() => {})
+    assert.equal(task.status, 'completed')
+    assert.deepEqual(await readFile(task.path), body)
+    assert.equal(task.rangeFallback, true)
+  } finally {
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('HTTP 522 is retried instead of failing on the first attempt', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-522-'))
+  const body = Buffer.alloc(256 * 1024, 5)
+  let blocked = 1
+  const { server, port } = await listen((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-length': String(body.length), 'accept-ranges': 'bytes' }).end()
+      return
+    }
+    if (blocked > 0) {
+      blocked -= 1
+      res.writeHead(522, { 'content-type': 'text/html' }).end('<title>Connection timed out</title>')
+      return
+    }
+    const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '')
+    const start = range === null ? 0 : Number(range[1])
+    const end = range === null || range[2] === '' ? body.length - 1 : Math.min(Number(range[2]), body.length - 1)
+    res.writeHead(206, {
+      'content-length': String(end - start + 1),
+      'content-range': `bytes ${start}-${end}/${body.length}`,
+    }).end(body.subarray(start, end + 1))
+  })
+  try {
+    const manager = stubManager(directory)
+    const task = makeTask(manager, `http://127.0.0.1:${port}/cf.bin`, { singleThread: true })
+    task.status = 'probing'
+    await task.run()
+    assert.equal(task.status, 'completed', 'a transient Cloudflare 522 must not fail the task')
+    assert.deepEqual(await readFile(task.path), body)
+  } finally {
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('HEAD 200 with a rejected Range probe still downloads in one connection', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-norange-'))
+  const body = Buffer.alloc(128 * 1024, 2)
+  const { server, port } = await listen((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-length': String(body.length) }).end()
+      return
+    }
+    // 拒绝 Range 请求：HEAD 明明成功，Range 探测回 405。
+    if (req.headers.range !== undefined) {
+      res.writeHead(405, { 'content-length': '0' }).end()
+      return
+    }
+    res.writeHead(200, { 'content-length': String(body.length) }).end(body)
+  })
+  try {
+    const manager = stubManager(directory)
+    const task = makeTask(manager, `http://127.0.0.1:${port}/norange.bin`, { singleThread: true })
+    task.status = 'probing'
+    await task.run()
+    assert.equal(task.status, 'completed', 'a 405 on the 1-byte Range probe must not kill the task')
+    assert.deepEqual(await readFile(task.path), body)
+  } finally {
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a zero-byte file answered with 416 still completes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-empty-'))
+  const { server, port } = await listen((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-length': '0', 'accept-ranges': 'bytes' }).end()
+      return
+    }
+    if (req.headers.range !== undefined) {
+      res.writeHead(416, { 'content-range': 'bytes */0' }).end()
+      return
+    }
+    res.writeHead(200, { 'content-length': '0' }).end()
+  })
+  try {
+    const manager = stubManager(directory)
+    const task = makeTask(manager, `http://127.0.0.1:${port}/empty.bin`, { singleThread: true })
+    task.status = 'probing'
+    await task.run()
+    assert.equal(task.status, 'completed')
+    assert.equal((await readFile(task.path)).length, 0)
+  } finally {
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a streamed response that drops mid-way restarts from zero instead of corrupting the file', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-norange-retry-'))
+  const body = Buffer.alloc(600 * 1024, 6)
+  let attempts = 0
+  const { server, port } = await listen((req, res) => {
+    // 不支持 Range，也不给 Content-Length：totalBytes 只能靠正文自己判断。
+    if (req.method === 'HEAD') {
+      res.writeHead(200).end()
+      return
+    }
+    if (req.headers.range !== undefined) {
+      res.writeHead(200).end()
+      return
+    }
+    attempts += 1
+    if (attempts === 1) {
+      res.writeHead(200, { 'content-length': String(body.length) })
+      res.write(body.subarray(0, 300 * 1024))
+      // 中途掐断连接：无 Range 模式没法从中间续传，任何「保留游标」的重试都会写错位。
+      setTimeout(() => res.socket?.destroy(), 20)
+      return
+    }
+    res.writeHead(200, { 'content-length': String(body.length) }).end(body)
+  })
+  try {
+    const manager = stubManager(directory)
+    const task = makeTask(manager, `http://127.0.0.1:${port}/stream.bin`, { singleThread: true })
+    task.status = 'probing'
+    await task.run().catch(() => {})
+    assert.equal(task.status, 'completed')
+    assert.deepEqual(await readFile(task.path), body, 'a restarted stream must be written from offset 0')
+    assert.ok(attempts >= 2, 'the dropped stream should have been retried')
+  } finally {
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a fatal chunk failure stops the other connections instead of finishing the file', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-failfast-'))
+  const body = Buffer.alloc(8 * 1024 * 1024, 8)
+  const { server, port } = await listen((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-length': String(body.length), 'accept-ranges': 'bytes' }).end()
+      return
+    }
+    const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '')
+    const start = range === null ? 0 : Number(range[1])
+    if (start === 0) {
+      // 不可重试的致命失败：这个分片已经没救。
+      res.writeHead(404, { 'content-length': '0' }).end()
+      return
+    }
+    // 其它分片慢慢发，证明它们没有一直被跑到尾。
+    const end = range[2] === '' ? body.length - 1 : Math.min(Number(range[2]), body.length - 1)
+    res.writeHead(206, {
+      'content-length': String(end - start + 1),
+      'content-range': `bytes ${start}-${end}/${body.length}`,
+    })
+    res.write(body.subarray(start, Math.min(end + 1, start + 64 * 1024)))
+    setTimeout(() => res.end(body.subarray(start + 64 * 1024, end + 1)), 30)
+  })
+  try {
+    const manager = stubManager(directory)
+    const task = makeTask(manager, `http://127.0.0.1:${port}/big.bin`, { threads: 4, threadsExplicit: true })
+    task.status = 'probing'
+    const started = Date.now()
+    await task.run().catch(() => {})
+    assert.equal(task.status, 'failed')
+    assert.ok(Date.now() - started < 5000, 'the task must settle as failed without draining the whole file')
   } finally {
     await close(server)
     await rm(directory, { recursive: true, force: true })

@@ -1,4 +1,4 @@
-﻿# 多线程下载器（DSH 插件）完整说明
+# 多线程下载器（DSH 插件）完整说明
 
 > 版本：1.4.2  
 > 仓库：https://github.com/NONON01/dsh-multithread-downloader  
@@ -65,7 +65,7 @@
 - 可选多算法校验（SHA-256 / SHA-512 / SHA-1 / MD5 / CRC32）、下载前磁盘空间检查
 - 全局限速（默认 100 MB/s）与并发限制数（默认 16 条连接，= 任务数 × 线程数；超出排队，Agent 自主模式同样受约束）
 - 设备负载自适应：每 2 秒采样 CPU/内存，持续高负载才收缩，空闲时回到设定值，回落逐步恢复
-- 站点风控自适应：403/429/503 后按站点降并发 + 聚合限速 + 冷却重试，站点之间互不影响
+- 站点风控自适应：403/429/503/567 后按站点降并发 + 聚合限速 + 冷却重试，站点之间互不影响
 - 可选 DoH 解析（Cloudflare / AliDNS / Tencent）
 - GitHub Release 直链自动转 API 资产链接
 - `forceDisplay` 强制显示低于静默阈值的任务，并显示速度曲线
@@ -254,7 +254,7 @@ Agent 通过 `downloader` 工具创建的任务视为 **Agent 下载**：
 | Agent 与阈值 | Agent 自主模式 | 开启 | 阈值设置置灰但继续生效 |
 | Agent 与阈值 | 静默下载阈值 | 16 MB | 1 KB–10 GB；可开关 |
 | Agent 与阈值 | 单线程阈值 | 4 MB | 0–10 GB；可开关 |
-| 网络与站点 | 站点风控自适应 | 开启 | 403/429/503 后按站点降档、限速、冷却 |
+| 网络与站点 | 站点风控自适应 | 开启 | 403/429/503/567 后按站点降档、限速、冷却 |
 | 网络与站点 | DoH 解析 | 关闭 | Cloudflare / AliDNS / Tencent；开启前弹风险确认 |
 | 网络与站点 | GitHub 模式 | 关闭 | GitHub Release 直链转 API 资产 |
 
@@ -297,7 +297,7 @@ multithread-downloader.json
 
 站点按**注册域**归并：`cdn.example.com`、`www.example.com`、`example.com/a`、`example.com/b` 属于同一个站点；`a.example.com.cn`、`bbc.co.uk` 这类两级后缀按三段处理；GitHub 的 `api.github.com` / `objects.githubusercontent.com` 统一算 `github.com`。这样同站不同页面不会各自计数、轮番撞风控。
 
-命中 403 / 429 / 503 时：
+命中 403 / 429 / 503 / 567 时（567 是腾讯云 EdgeOne 的 WAF 拦截码，实测于 `drivers.amd.com`）：
 
 | 档位 | 站点并发 | 站点聚合限速 | 冷却 |
 |---|---|---|---|

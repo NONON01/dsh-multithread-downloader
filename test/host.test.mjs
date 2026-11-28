@@ -13,7 +13,7 @@ const {
   normalizeChecksum, parseGithubReleaseUrl, normalizeDohProvider, autoThreadsForBytes,
   fingerprintChange, ifRangeValue, DownloadTask, Downloader, LoadGovernor, SiteGovernor, SiteLimiter,
   siteKeyForUrl, cpuPercentBetween, loadStepFor, memoryPressurePercent, signedUrlExpiry, headersForRedirect,
-  httpStatusOf, SITE_LEVELS, makeDohTool, makeProbeTool,
+  httpStatusOf, SITE_LEVELS, RISK_STATUS, makeDohTool, makeProbeTool,
 } = __test
 
 const MB = 1024 * 1024
@@ -867,6 +867,81 @@ test('a 403 risk signal throttles the site and the download resumes', async () =
     assert.equal(sites.length, 1)
     assert.equal(sites[0].level, 1)
     assert.equal(sites[0].connections, SITE_LEVELS[1].cap)
+  } finally {
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('567 (EdgeOne WAF) counts as a site risk signal', async () => {
+  assert.ok(RISK_STATUS.has(567), '567 must be a risk status, otherwise a real WAF block never downgrades the site')
+  const manager = stubManager(tmpdir())
+  const site = manager.siteGovernor.limiterFor('https://drivers.amd.com/drivers/file.exe')
+  const spec = site.penalize(567, 1000)
+  assert.equal(site.level, 1)
+  assert.equal(spec.cap, SITE_LEVELS[1].cap)
+  assert.equal(manager.siteGovernor.snapshot()[0].level, 1)
+})
+
+test('a 567 block downgrades the site and the download still finishes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-waf-'))
+  const body = Buffer.alloc(512 * 1024, 7)
+  let blocked = 1
+  const { server, port } = await listen((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-length': String(body.length), 'accept-ranges': 'bytes' }).end()
+      return
+    }
+    if (blocked > 0) {
+      blocked -= 1
+      res.writeHead(567, { 'content-type': 'text/html' }).end('<title>Restricted Access</title>')
+      return
+    }
+    const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '')
+    const start = range === null ? 0 : Number(range[1])
+    const end = range === null || range[2] === '' ? body.length - 1 : Math.min(Number(range[2]), body.length - 1)
+    res.writeHead(206, {
+      'content-length': String(end - start + 1),
+      'content-range': `bytes ${start}-${end}/${body.length}`,
+    }).end(body.subarray(start, end + 1))
+  })
+  try {
+    const manager = stubManager(directory)
+    const task = makeTask(manager, `http://127.0.0.1:${port}/waf.bin`, { singleThread: true })
+    task.status = 'probing'
+    await task.run()
+    assert.equal(task.status, 'completed')
+    assert.deepEqual(await readFile(task.path), body)
+    assert.ok(task.riskRetries >= 1, 'a 567 must consume a risk retry, not a network retry')
+    assert.match(task.riskNote, /567/)
+    const sites = manager.siteGovernor.snapshot()
+    assert.equal(sites.length, 1)
+    assert.equal(sites[0].level, 1)
+  } finally {
+    await close(server)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a persistent 567 fails fast with an actionable message', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mtd-waf2-'))
+  const { server, port } = await listen((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-length': '1024', 'accept-ranges': 'bytes' }).end()
+      return
+    }
+    res.writeHead(567, { 'content-type': 'text/html' }).end('<title>Restricted Access</title>')
+  })
+  try {
+    const manager = stubManager(directory, { siteAdaptive: false })
+    const task = makeTask(manager, `http://127.0.0.1:${port}/waf.bin`, { singleThread: true })
+    task.status = 'probing'
+    const started = Date.now()
+    await task.run().catch(() => {})
+    assert.equal(task.status, 'failed')
+    assert.match(task.error, /HTTP 567/)
+    assert.match(task.error, /WAF|安全策略/)
+    assert.ok(Date.now() - started < 5000, 'a WAF block must not sit in a retry loop')
   } finally {
     await close(server)
     await rm(directory, { recursive: true, force: true })

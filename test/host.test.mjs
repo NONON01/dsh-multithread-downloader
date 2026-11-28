@@ -1165,6 +1165,19 @@ test('DoH resolver reads A/AAAA from a JSON endpoint and caches them', async () 
   }
 })
 
+test('an unreachable DoH provider names itself and suggests an alternative', async () => {
+  // 本机网络经常只挡住某一个提供商（Cloudflare 最典型），裸的 fetch failed 帮不上忙。
+  const resolver = lib.doh.createDohResolver({ provider: 'cloudflare', endpoint: 'http://127.0.0.1:1/dns-query', timeoutMs: 3000 })
+  await assert.rejects(
+    () => resolver.query('example.test', 'A'),
+    (error) => {
+      assert.match(error.message, /cloudflare/)
+      assert.match(error.message, /alidns/)
+      return true
+    },
+  )
+})
+
 test('doh_lookup tool validates input and short-circuits IP literals', async () => {
   const tool = makeDohTool({ dohProvider: 'alidns' })
   const missing = await tool.execute({})

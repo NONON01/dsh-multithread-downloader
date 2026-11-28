@@ -1,4 +1,4 @@
-# 多线程下载器（DSH 插件）完整说明
+﻿# 多线程下载器（DSH 插件）完整说明
 
 > 版本：1.4.2  
 > 仓库：https://github.com/NONON01/dsh-multithread-downloader  
@@ -761,7 +761,7 @@ npm test
 npm pack --dry-run
 ```
 
-测试覆盖（82 项：`test/host.test.mjs` 72 项 + `test/plugin.test.mjs` 4 项 + `test/stall.test.mjs` 6 项）：
+测试覆盖（83 项：`test/host.test.mjs` 73 项 + `test/plugin.test.mjs` 4 项 + `test/stall.test.mjs` 6 项）：
 
 - 请求头清洗、非法 header 名拒绝、跨域重定向剥离敏感头、探测/401 提示
 - 分片下载、4 MB 分段轮转、连接预算共享与排队、单任务不超预算

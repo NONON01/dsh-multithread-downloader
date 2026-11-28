@@ -235,6 +235,8 @@ Agent 通过 `downloader` 工具创建的任务视为 **Agent 下载**：
 - 任务总大小 ≥ 静默阈值
 - 任务设置了 `forceDisplay: true`
 
+曲线最多 240 个点：最近两分钟是 1 秒一个，更早的会按档折叠（每格时长翻倍），所以长任务看到的是全程趋势，而不是只剩最近几分钟。
+
 ---
 
 ## 设置项
@@ -759,7 +761,7 @@ npm test
 npm pack --dry-run
 ```
 
-测试覆盖（79 项：`test/host.test.mjs` 69 项 + `test/plugin.test.mjs` 4 项 + `test/stall.test.mjs` 6 项）：
+测试覆盖（82 项：`test/host.test.mjs` 72 项 + `test/plugin.test.mjs` 4 项 + `test/stall.test.mjs` 6 项）：
 
 - 请求头清洗、非法 header 名拒绝、跨域重定向剥离敏感头、探测/401 提示
 - 分片下载、4 MB 分段轮转、连接预算共享与排队、单任务不超预算

@@ -114,7 +114,16 @@ const ESCALATE_MAX_THREADS = 8
 /** 超过该大小的任务才记录并返回进度采样历史（面板据此绘制曲线）。 */
 const DEFAULT_LARGE_FILE_MB = 16
 const DEFAULT_MIN_THREAD_MB = 4
+/**
+ * 进度曲线点数上限（面板响应体预算）。采样分两档：
+ * - 细档 `HISTORY_FINE` 个点，每秒一个，覆盖最近两分钟；
+ * - 粗档 `HISTORY_COARSE` 个桶，覆盖全程，桶满一次就整体合并、每格时长翻倍。
+ * 于是几小时的任务也能看到完整曲线，点数与响应体大小都不变。丢掉最老的点只会剩下
+ * 「开头一点 + 一大段空白」，所以这里用折叠而不是截断。
+ */
 const HISTORY_LIMIT = 240
+const HISTORY_FINE = 120
+const HISTORY_COARSE = HISTORY_LIMIT - HISTORY_FINE
 const DISK_MARGIN_BYTES = 32 * 1024 * 1024
 /**
  * 分片正文空闲超时：服务端回了响应头却迟迟不发数据（弱网、半死连接、中间设备黑洞），
@@ -176,15 +185,6 @@ function resolveProfileDirectory() {
     : 'desktop'
   return join(homedir(), '.dsh', 'profiles', name)
 }
-
-
-
-
-
-
-
-
-
 
 /** 一个下载任务。 */
 class DownloadTask {
@@ -265,7 +265,10 @@ class DownloadTask {
     this.sampler = null
     this.lastSample = 0
     this.lastSampleAt = 0
+    /** 进度曲线：粗档（全程，每格 historyStep 秒）+ 细档（最近两分钟，每秒一点）。 */
     this.history = []
+    this.recent = []
+    this.historyStep = 1
     /** 停滞看门狗：自动换连接的次数、是否已判定「远端极慢」、给用户看的说明。 */
     this.stallResets = 0
     this.stallSlow = false
@@ -353,8 +356,9 @@ class DownloadTask {
       finishedAt: this.finishedAt,
     }
     // 仅大文件回传采样历史，避免小任务的轮询负载。
-    if (options.history === true && this.manager.shouldDisplay(this) && this.history.length > 0) {
-      snapshot.history = this.history.slice()
+    if (options.history === true && this.manager.shouldDisplay(this)) {
+      const points = this.historyPoints()
+      if (points.length > 0) snapshot.history = points
     }
     return snapshot
   }
@@ -387,17 +391,53 @@ class DownloadTask {
     }
   }
 
+  /** 曲线快照：粗档（全程）在前、细档（最近两分钟）在后，时间严格递增。 */
+  historyPoints() {
+    return this.history.concat(this.recent)
+  }
+
+  /** 细档溢出：最老的一点落进粗档对应的时间格；同一格里再来就取均值。 */
+  spillToCoarse(point) {
+    const step = this.historyStep
+    const bucket = Math.floor(point.t / step)
+    const last = this.history[this.history.length - 1]
+    if (last !== undefined && Math.floor(last.t / step) === bucket) {
+      this.history[this.history.length - 1] = { t: last.t, p: point.p, s: (last.s + point.s) / 2 }
+    } else {
+      this.history.push({ t: bucket * step, p: point.p, s: point.s })
+    }
+    if (this.history.length > HISTORY_COARSE) this.coarsenHistory()
+  }
+
+  /** 粗档也满了：每格时长翻倍，相邻两格合并成一格（速度取均值），全程不丢。 */
+  coarsenHistory() {
+    this.historyStep *= 2
+    const step = this.historyStep
+    const merged = []
+    for (const point of this.history) {
+      const bucket = Math.floor(point.t / step)
+      const last = merged[merged.length - 1]
+      if (last !== undefined && Math.floor(last.t / step) === bucket) {
+        last.p = point.p
+        last.s = (last.s + point.s) / 2
+      } else {
+        merged.push({ t: bucket * step, p: point.p, s: point.s })
+      }
+    }
+    this.history = merged
+  }
+
   recordHistory(now) {
     if (!this.manager.shouldDisplay(this)) return
     const elapsed = Math.max(0, Math.floor((now - this.startedAt) / 1000))
-    const last = this.history[this.history.length - 1]
+    const last = this.recent.length > 0 ? this.recent[this.recent.length - 1] : this.history[this.history.length - 1]
     if (last !== undefined && last.t >= elapsed) return
-    this.history.push({
+    this.recent.push({
       t: elapsed,
       p: Math.round(this.progress * 1000) / 1000,
       s: this.speed,
     })
-    if (this.history.length > HISTORY_LIMIT) this.history.splice(0, this.history.length - HISTORY_LIMIT)
+    while (this.recent.length > HISTORY_FINE) this.spillToCoarse(this.recent.shift())
   }
 
   startSampler() {
@@ -661,7 +701,7 @@ class DownloadTask {
     if (this.runToken !== run || this.status !== 'probing') return
     this.status = 'downloading'
     this.startedAt = this.startedAt || Date.now()
-    if (this.manager.shouldDisplay(this) && this.history.length === 0) {
+    if (this.manager.shouldDisplay(this) && this.historyPoints().length === 0) {
       this.history = [{ t: 0, p: 0, s: 0 }]
     }
     await this.runChunks(run)
@@ -1269,6 +1309,8 @@ class DownloadTask {
     this.receivedBytes = 0
     this.progress = 0
     this.history = []
+    this.recent = []
+    this.historyStep = 1
     if (this.manager.shouldDisplay(this)) this.history = [{ t: 0, p: 0, s: 0 }]
     this.resetFile = true
   }
@@ -1288,6 +1330,8 @@ class DownloadTask {
     this.receivedBytes = 0
     this.progress = 0
     this.history = []
+    this.recent = []
+    this.historyStep = 1
     if (this.manager.shouldDisplay(this)) this.history = [{ t: 0, p: 0, s: 0 }]
     this.resetFile = true
     this.status = 'downloading'
@@ -1303,6 +1347,8 @@ class DownloadTask {
     this.receivedBytes = 0
     this.progress = 0
     this.history = []
+    this.recent = []
+    this.historyStep = 1
     if (this.manager.shouldDisplay(this)) this.history = [{ t: 0, p: 0, s: 0 }]
     this.closeHandle()
     this.resetFile = true
@@ -1491,8 +1537,9 @@ class DownloadTask {
     this.stopSampler()
     if (this.manager.shouldDisplay(this)) {
       const elapsed = Math.max(1, Math.floor((this.finishedAt - this.startedAt) / 1000))
-      const last = this.history[this.history.length - 1]
-      if (last === undefined || last.t < elapsed) this.history.push({ t: elapsed, p: 1, s: 0 })
+      const last = this.recent.length > 0 ? this.recent[this.recent.length - 1] : this.history[this.history.length - 1]
+      if (last === undefined || last.t < elapsed) this.recent.push({ t: elapsed, p: 1, s: 0 })
+      else if (this.recent.length > 0) this.recent[this.recent.length - 1] = { ...last, p: 1, s: 0 }
       else this.history[this.history.length - 1] = { ...last, p: 1, s: 0 }
     }
     this.manager.persistTasks()

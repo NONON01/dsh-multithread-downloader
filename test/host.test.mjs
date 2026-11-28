@@ -736,6 +736,35 @@ test('SiteLimiter escalates on risk signals and recovers after enough successes'
   assert.equal(site.level, 0)
 })
 
+test('SiteLimiter walks the whole recovery ramp from the deepest level', () => {
+  const site = new SiteLimiter('example.com')
+  const deepest = SITE_LEVELS.length - 1
+  // 连续命中风控升到最深档，但不会越过最后一档。
+  for (let hit = 0; hit < 10; hit += 1) site.penalize(429, 1000 + hit)
+  assert.equal(site.level, deepest)
+  assert.equal(site.cap, SITE_LEVELS[deepest].cap)
+  assert.equal(site.rateBytes, SITE_LEVELS[deepest].rate)
+  // 每上升一档要连续成功 24 × 当前档位段：4→3 是 96 段，3→2 是 72，2→1 是 48，1→0 是 24。
+  const ramps = [96, 72, 48, 24]
+  for (const [index, count] of ramps.entries()) {
+    const before = deepest - index
+    for (let step = 0; step < count - 1; step += 1) site.reward()
+    // 差一段不算：必须刚好凑够才回升，否则刚放行又被风控。
+    assert.equal(site.level, before)
+    site.reward()
+    assert.equal(site.level, before - 1)
+    // 回升一档就立刻放宽连接上限与聚合限速。
+    assert.equal(site.cap, SITE_LEVELS[before - 1].cap)
+    assert.equal(site.rateBytes, SITE_LEVELS[before - 1].rate)
+  }
+  assert.equal(site.level, 0)
+  // 回到 0 档后继续成功不会掉成负数（-1 会让 SITE_LEVELS 取到 undefined）。
+  site.reward()
+  site.reward()
+  assert.equal(site.level, 0)
+  assert.equal(site.signals, 10)
+})
+
 test('SiteGovernor keeps each site policy independent', () => {
   const governor = new SiteGovernor(true)
   governor.penalize('https://a.example.com/1', 403)
@@ -946,6 +975,60 @@ test('snapshot reports remaining bytes and ETA only while downloading', () => {
   task.status = 'downloading'
   task.speed = 0
   assert.equal(task.snapshot().etaSeconds, undefined)
+})
+
+test('progress history folds old samples instead of dropping them, keeping the whole run', () => {
+  const manager = stubManager('/tmp')
+  const task = makeTask(manager, 'https://example.test/a.bin')
+  const base = 1_700_000_000_000
+  const hours = 4
+  task.startedAt = base
+  task.totalBytes = hours * 3600 * MB
+  task.history = [{ t: 0, p: 0, s: 0 }]
+  for (let second = 1; second <= hours * 3600; second += 1) {
+    task.receivedBytes = second * MB
+    task.progress = task.receivedBytes / task.totalBytes
+    task.speed = MB
+    task.recordHistory(base + second * 1000)
+  }
+  const points = task.snapshot({ history: true }).history
+  // 点数预算不变，所以面板响应体不会因为长任务变大。
+  assert.ok(points.length <= 240)
+  // 全程都在：从第 0 秒到现在，时间严格递增，没有停在「最近几分钟」。
+  assert.equal(points[0].t, 0)
+  assert.equal(points[points.length - 1].t, hours * 3600)
+  for (let index = 1; index < points.length; index += 1) {
+    assert.ok(points[index].t > points[index - 1].t)
+    assert.ok(points[index].p >= points[index - 1].p)
+  }
+  // 最近的半分钟仍是 1 秒分辨率。
+  const tail = points.slice(-30)
+  for (let index = 1; index < tail.length; index += 1) assert.equal(tail[index].t - tail[index - 1].t, 1)
+  // 折叠是取均值：粗档那部分的速度仍是真实速度（开头那个种子点的 0 会被后面拉平）。
+  const coarse = points.filter((point) => point.t < hours * 3600 - 120)
+  assert.ok(coarse.length > 0)
+  const coarseAverage = coarse.reduce((sum, point) => sum + point.s, 0) / coarse.length
+  assert.ok(coarseAverage > 0.9 * MB && coarseAverage <= MB)
+})
+
+test('a short run keeps one history point per second', () => {
+  const manager = stubManager('/tmp')
+  const task = makeTask(manager, 'https://example.test/a.bin')
+  const base = 1_700_000_000_000
+  task.startedAt = base
+  task.totalBytes = 200 * MB
+  task.history = [{ t: 0, p: 0, s: 0 }]
+  for (let second = 1; second <= 100; second += 1) {
+    task.receivedBytes = second * MB
+    task.progress = task.receivedBytes / task.totalBytes
+    task.speed = MB
+    task.recordHistory(base + second * 1000)
+  }
+  const points = task.snapshot({ history: true }).history
+  assert.equal(points.length, 101)
+  for (let index = 1; index < points.length; index += 1) {
+    assert.equal(points[index].t - points[index - 1].t, 1)
+  }
 })
 
 test('add writes into a Chinese-named directory with a Chinese filename', async () => {
